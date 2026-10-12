@@ -1,0 +1,29 @@
+#ifndef OLDSRV_PROTOCOL_FAIR_PVP_SCORE_STREAM_H_
+#define OLDSRV_PROTOCOL_FAIR_PVP_SCORE_STREAM_H_
+
+#include "infra/network/packet/stream_guard.h"
+
+struct SIG_FAIR_PVP_SCORE;
+
+// IDA_EA: 0x84A67F2
+// IDA_NAME: _ZN12CStreamGuard11GetInBufferI18SIG_FAIR_PVP_SCOREEEPT_v
+// DEMANGLED: SIG_FAIR_PVP_SCORE * CStreamGuard::GetInBuffer<SIG_FAIR_PVP_SCORE>(void)
+template <>
+SIG_FAIR_PVP_SCORE*
+CStreamGuard::GetInBuffer<SIG_FAIR_PVP_SCORE>();
+
+// IDA_EA: 0x84A6E98
+// IDA_NAME: _ZN6Stream11GetInBufferI18SIG_FAIR_PVP_SCOREEEPT_v
+// DEMANGLED: SIG_FAIR_PVP_SCORE * Stream::GetInBuffer<SIG_FAIR_PVP_SCORE>(void)
+template <>
+SIG_FAIR_PVP_SCORE*
+Stream::GetInBuffer<SIG_FAIR_PVP_SCORE>();
+
+// IDA_EA: 0x8453C10
+// IDA_NAME: _ZN6Stream12GetOutBufferI18SIG_FAIR_PVP_SCOREEEPT_v
+// DEMANGLED: SIG_FAIR_PVP_SCORE * Stream::GetOutBuffer<SIG_FAIR_PVP_SCORE>(void)
+template <>
+SIG_FAIR_PVP_SCORE*
+Stream::GetOutBuffer<SIG_FAIR_PVP_SCORE>();
+
+#endif  // OLDSRV_PROTOCOL_FAIR_PVP_SCORE_STREAM_H_

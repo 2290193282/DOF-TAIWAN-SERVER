@@ -1,0 +1,1539 @@
+#include "old_game/pvp/battlefield/battle_field.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <list>
+#include <map>
+#include <utility>
+#include <vector>
+
+#include "old_data/PVF/aicharacter/datamanager/ai_character_runtime.h"
+#include "old_data/PVF/map/datamanager/dungeon_runtime.h"
+#include "old_data/PVF/map/datamanager/map_runtime.h"
+#include "old_data/PVF/aicharacter/datamanager/monster_manager.h"
+#include "old_data/PVF/data/datamanager/server_parameter_script.h"
+#include "old_game/social/party/hellparty_characlink_abi.h"
+#include "old_game/economy/inventory/item_generator_mgr_abi.h"
+#include "common/manager/global_lifecycle.h"
+#include "common/manager/server_utility.h"
+#include "infra/log/format/trace.h"
+#include "old_data/PVF/data/data_manager.h"
+#include "old_data/PVF/data/item_generator_types.h"
+#include "old_game/social/party/party.h"
+
+char setBasicAbilityByLevel(const STMonsterScript* script,
+                            ActiveStaticInfo* ability,
+                            int monster_level,
+                            int dungeon_index,
+                            int monster_kind,
+                            bool force_boss,
+                            bool force_tower);
+bool upgradeAbilityByMonsterParameterCategory(
+    const std::vector<STMonsterParameterCategory>* categories,
+    ActiveStaticInfo* ability,
+    bool boss);
+ActiveStaticInfo* upgradeAbilityByDifficultyOfDungeon(
+    int dungeon_difficulty,
+    ActiveStaticInfo* ability,
+    int monster_level,
+    const std::vector<std::vector<float> >& dungeon_bonus);
+void upgradeAbilityByBossFeature(ActiveStaticInfo* ability);
+ActiveStaticInfo* upgradeAbilityByChampionFeature(
+    int champion_element,
+    int monster_kind,
+    std::vector<int>* features,
+    ActiveStaticInfo* ability);
+int getRandomChampionElement(const STMonsterScript* script, int seed);
+char makeChampionFeatureList(std::vector<int>& scripted_features,
+                             int monster_level,
+                             int seed,
+                             std::vector<int>& output,
+                             int dungeon_difficulty);
+
+namespace {
+
+unsigned char ClampMonsterLevel(int value) {
+    if (value <= 0) {
+        return 1;
+    }
+    if (value > 200) {
+        return 200;
+    }
+    return static_cast<unsigned char>(value);
+}
+
+// The two APC paths execute an exact full-object zeroing pass after C2.
+// Spell that operation in terms of the recovered object members so vector and
+// ActiveStaticInfo lifetimes remain valid in C++.
+void ResetMapMonsterForMapAssembly(map_monster& monster) {
+    monster.spawn_sequence_ = 0;
+    monster.map_monster_unique_id_ = 0;
+    monster.monster_kind_ = 0;
+    std::fill(monster.raw_09_0b_, monster.raw_09_0b_ + 3, 0);
+    monster.monster_id_ = 0;
+    monster.monster_level_ = 0;
+    monster.specific_drop_count_ = 0;
+    monster.random_drop_count_ = 0;
+    monster.packet_value_13_ = 0;
+    monster.stage_monster_type_ = 0;
+    std::fill(monster.raw_15_17_, monster.raw_15_17_ + 3, 0);
+    monster.runtime_value_18_ = 0;
+    monster.runtime_value_1c_ = 0;
+    monster.runtime_value_20_ = 0;
+    monster.sdc_damaged_packet_count_ = 0;
+    monster.sdc_damage_value_ = 0;
+    monster.assigned_team_ = 0;
+    monster.spawn_weight_ = 0;
+    monster.no_hit_animation_ = 0;
+    std::fill(monster.raw_35_37_, monster.raw_35_37_ + 3, 0);
+    monster.active_static_info_.clear();
+    monster.related_monster_ids_.clear();
+    monster.hell_party_group_order_ = 0;
+    monster.hell_party_group_index_ = 0;
+    monster.hell_party_difficulty_ = 0;
+    monster.reserved_339_ = 0;
+    monster.blood_small_round_order_ = 0;
+    monster.blood_spawn_rate_per_mille_ = 0;
+    monster.blood_system_value_08_ = 0;
+    monster.blood_system_value_0c_ = 0;
+    monster.blood_system_value_10_ = 0;
+    monster.blood_runtime_flag_ = 0;
+    monster.blood_variant_ = 0;
+    monster.blood_round_ = 0;
+    monster.blood_round_difficulty_ = 0;
+    monster.drop_limit_excluded_ = 0;
+    monster.counted_by_map_info_ = 0;
+    monster.completed_ = 0;
+}
+
+// The 0828 client importer owns [map move monster] as a grouped table, but no
+// client-side runtime selector exists and the original 0828 server consumer is
+// unavailable.  The three official Largus rows differ only in the opaque
+// accumulated field (40/30/30), so map_runtime.cpp admits them only when their
+// complete server projection is otherwise identical.  Materialize that common
+// projection once and let the recovered ordinary monster assembly path provide
+// the authoritative MapInfo object used by Golden Commerce.
+bool AppendGoldenCommerceCartProjection(
+    int dungeon_index,
+    std::list<_mapMonster>* monsters) {
+    if (!monsters) {
+        return false;
+    }
+    if (!dungeon_runtime::IsGoldenCommerceDungeon(dungeon_index)) {
+        return true;
+    }
+
+    dungeon_runtime::MapMoveMonster projection;
+    if (!dungeon_runtime::GetMapMoveMonsterProjection(
+            dungeon_index, 0, &projection) ||
+        projection.monster_id <= 0 || projection.level <= 0 ||
+        projection.level > 255 || projection.rank < 0 ||
+        projection.rank > 3) {
+        return false;
+    }
+
+    for (std::list<_mapMonster>::const_iterator it = monsters->begin();
+         it != monsters->end(); ++it) {
+        if (it->map_index == projection.monster_id) {
+            // ScanCurrentCart requires exactly one live cart.  A map-authored
+            // duplicate is a configuration error rather than a reason to
+            // silently create a second candidate.
+            return false;
+        }
+    }
+
+    _mapMonster cart;
+    cart.map_index = projection.monster_id;
+    cart.enabled = static_cast<uint8_t>(projection.enabled != 0);
+    cart.raw_08 = projection.level;
+    cart.raw_0c = 0;  // recovered ordinary path: spawn exactly one entity
+    cart.raw_10 = projection.specific_drop_count;
+    cart.raw_14 = projection.random_drop_count;
+    cart.raw_18 = projection.rank;
+    cart.raw_1c = static_cast<uint8_t>(projection.value_24 != 0);
+    cart.raw_20 = 0;
+    cart.raw_24 = 0;
+    // The deferred client object is a player/friendly escort target.  Keep the
+    // server-side MapInfo projection on the same team; ordinary enemies use
+    // team 100.
+    cart.raw_28 = 0;
+    cart.raw_2c = projection.group;
+    cart.raw_30 = 0;
+    monsters->push_back(cart);
+    return true;
+}
+
+bool IsGoldenCommerceCartProjection(int dungeon_index, int monster_id) {
+    dungeon_runtime::MapMoveMonster projection;
+    return monster_id > 0 &&
+           dungeon_runtime::IsGoldenCommerceDungeon(dungeon_index) &&
+           dungeon_runtime::GetMapMoveMonsterProjection(
+               dungeon_index, 0, &projection) &&
+           projection.monster_id == monster_id;
+}
+}  // namespace
+
+// IDA_EA: 0x8300C76
+// IDA_NAME: _ZN13CBattle_Field27checkClearedNamedMonsterMapEhi
+// DEMANGLED: CBattle_Field::checkClearedNamedMonsterMap(unsigned char,int)
+int CBattle_Field::checkClearedNamedMonsterMap(
+    unsigned char position_index,
+    int monster_id) {
+    if (!dungeon_ || position_index >= dungeon_->named_monster_positions_.size()) {
+        return 0;
+    }
+    const STNamedMonsterMapPos& position =
+        dungeon_->named_monster_positions_[position_index];
+    MapInfo* const map_info = GetMapInfoFromPos(
+        static_cast<int>(position.x), static_cast<int>(position.y), false);
+    if (!map_info->visited_goto_) {
+        return 0;
+    }
+
+    map_monster probe;
+    probe.monster_id_ = monster_id;
+    return probe.isNamedMonster() ? 1 : 0;
+}
+
+// IDA_EA: 0x83035C8
+// IDA_NAME: _ZN13CBattle_Field17ConsistTournamentEPK4CMapRSt4listI11_mapMonsterSaIS4_EERSt3mapIsSt6vectorINS_14TournamentInfoESaISA_EESt4lessIsESaISt4pairIKsSC_EEE
+bool CBattle_Field::ConsistTournament(
+    const CMap* map,
+    std::list<_mapMonster>& monsters,
+    std::map<short, std::vector<TournamentInfo> >& rounds) {
+    if (!map) {
+        cMyTrace trace(
+            "bool CBattle_Field::ConsistTournament(const CMap*, MOB_REF_LIST&, CBattle_Field::TournamentRoundInfoMap&)",
+            2906,
+            5);
+        trace("CBattle_Field::ConsistTournament ERROR!! : pMap is NULL pointer");
+        return false;
+    }
+    if (map->tournament_monsters_.empty()) {
+        cMyTrace trace(
+            "bool CBattle_Field::ConsistTournament(const CMap*, MOB_REF_LIST&, CBattle_Field::TournamentRoundInfoMap&)",
+            2913,
+            5);
+        trace("CBattle_Field::ConsistTournament ERROR!! : tournamentMonster is empty");
+        return false;
+    }
+
+    const int member_count = party_->get_member_count();
+    std::map<char, std::vector<TournamentMonster> >::const_iterator found =
+        map->tournament_monsters_.find(static_cast<char>(member_count));
+    if (found == map->tournament_monsters_.end()) {
+        cMyTrace trace(
+            "bool CBattle_Field::ConsistTournament(const CMap*, MOB_REF_LIST&, CBattle_Field::TournamentRoundInfoMap&)",
+            2924,
+            5);
+        trace("CBattle_Field::ConsistTournament ERROR!! : party member count is invalid(%d)",
+              party_->get_member_count());
+        return false;
+    }
+
+    std::vector<TournamentMonster> source = found->second;
+    std::vector<TournamentInfo> basic_round;
+    if (!MakeBasicRoundInfo(member_count, source, basic_round)) {
+        return false;
+    }
+    std::sort(basic_round.begin(), basic_round.end());
+
+    std::vector<TournamentInfo> first_group;
+    ChoiceFirstGroup(basic_round, first_group);
+    ConsistTournamentRound(first_group, basic_round, rounds, monsters);
+    return true;
+}
+
+// IDA_EA: 0x8303896
+// IDA_NAME: _ZN13CBattle_Field18MakeBasicRoundInfoEiRSt6vectorI17TournamentMonsterSaIS1_EERS0_INS_14TournamentInfoESaIS5_EE
+bool CBattle_Field::MakeBasicRoundInfo(
+    int member_count,
+    std::vector<TournamentMonster>& monsters,
+    std::vector<TournamentInfo>& basic_round) {
+    std::random_shuffle(monsters.begin(), monsters.end());
+    std::vector<TournamentMonster>::iterator monster = monsters.begin();
+    if (monster == monsters.end()) {
+        return false;
+    }
+
+    int group_count = 0;
+    for (; group_count <= 14; ++group_count) {
+        if (monster == monsters.end()) {
+            break;
+        }
+        TournamentInfo info;
+        for (int member = 0; member < member_count; ++member) {
+            info.monsters_[member] = *monster;
+            info.key_ += monster->count;
+            ++monster;
+        }
+        basic_round.push_back(info);
+    }
+    return group_count == 15;
+}
+
+// IDA_EA: 0x8303A1C
+// IDA_NAME: _ZN13CBattle_Field16ChoiceFirstGroupERSt6vectorINS_14TournamentInfoESaIS1_EES4_
+char CBattle_Field::ChoiceFirstGroup(
+    std::vector<TournamentInfo>& basic_round,
+    std::vector<TournamentInfo>& first_group) {
+    std::vector<TournamentInfo>::iterator it = basic_round.begin();
+    const int first_key = it->key_;
+    char result = 0;
+    while (it != basic_round.end()) {
+        result = static_cast<char>(it->key_ == first_key);
+        if (!result) {
+            break;
+        }
+        first_group.push_back(*it);
+        it = basic_round.erase(it);
+    }
+    return result;
+}
+
+// IDA_EA: 0x8303ACE
+// IDA_NAME: _ZN13CBattle_Field22ConsistTournamentRoundERSt6vectorINS_14TournamentInfoESaIS1_EES4_RSt3mapIsS3_St4lessIsESaISt4pairIKsS3_EEERSt4listI11_mapMonsterSaISF_EE
+int CBattle_Field::ConsistTournamentRound(
+    std::vector<TournamentInfo>& first_group,
+    std::vector<TournamentInfo>& basic_round,
+    std::map<short, std::vector<TournamentInfo> >& rounds,
+    std::list<_mapMonster>& monsters) {
+    const int empty_slot = static_cast<int>(get_rand_int(16));
+    std::map<short, TournamentInfo> bracket;
+    TournamentInfo empty;
+    empty.round_ = static_cast<short>(empty_slot);
+    bracket.insert(std::make_pair(empty.round_, empty));
+
+    const int first_slot =
+        (empty_slot & 1) ? empty_slot - 1 : empty_slot + 1;
+    std::random_shuffle(first_group.begin(), first_group.end());
+    first_group.begin()->round_ = static_cast<short>(first_slot);
+    bracket.insert(std::make_pair(first_group.begin()->round_,
+                                  *first_group.begin()));
+    first_group.erase(first_group.begin());
+
+    std::vector<int> slots;
+    for (int slot = 0; slot <= 15; ++slot) {
+        if (slot != empty_slot && slot != first_slot) {
+            slots.push_back(slot);
+        }
+    }
+    std::random_shuffle(slots.begin(), slots.end());
+    InsertTournamentInfo(slots, first_group, bracket);
+    InsertTournamentInfo(slots, basic_round, bracket);
+    return MakeRoundInfo(bracket, rounds, monsters);
+}
+
+// IDA_EA: 0x8303E02
+// IDA_NAME: _ZN13CBattle_Field20InsertTournamentInfoERSt6vectorIiSaIiEERS0_INS_14TournamentInfoESaIS4_EERSt3mapIsS4_St4lessIsESaISt4pairIKsS4_EEE
+bool CBattle_Field::InsertTournamentInfo(
+    std::vector<int>& slots,
+    std::vector<TournamentInfo>& infos,
+    std::map<short, TournamentInfo>& bracket) {
+    std::vector<int>::iterator slot = slots.begin();
+    std::vector<TournamentInfo>::iterator info = infos.begin();
+    while (info != infos.end() && slot != slots.end()) {
+        info->round_ = static_cast<short>(*slot);
+        bracket.insert(std::make_pair(info->round_, *info));
+        info = infos.erase(info);
+        slot = slots.erase(slot);
+    }
+    return false;
+}
+
+// IDA_EA: 0x8303F66
+// IDA_NAME: _ZN13CBattle_Field13MakeRoundInfoERSt3mapIsNS_14TournamentInfoESt4lessIsESaISt4pairIKsS1_EEERS0_IsSt6vectorIS1_SaIS1_EES3_SaIS4_IS5_SC_EEERSt4listI11_mapMonsterSaISI_EE
+int CBattle_Field::MakeRoundInfo(
+    std::map<short, TournamentInfo>& bracket,
+    std::map<short, std::vector<TournamentInfo> >& rounds,
+    std::list<_mapMonster>& monsters) {
+    for (int round = 1; round <= 4; ++round) {
+        std::vector<TournamentInfo> snapshot;
+        for (std::map<short, TournamentInfo>::iterator it = bracket.begin();
+             it != bracket.end();
+             ++it) {
+            snapshot.push_back(it->second);
+        }
+        rounds.insert(std::make_pair(static_cast<short>(round), snapshot));
+        MakeNextRoundInfo(round, bracket);
+    }
+    return MakeTournamentMonsterList(rounds, monsters) ? 1 : 0;
+}
+
+// IDA_EA: 0x830410C
+// IDA_NAME: _ZN13CBattle_Field17MakeNextRoundInfoEiRSt3mapIsNS_14TournamentInfoESt4lessIsESaISt4pairIKsS1_EEE
+int CBattle_Field::MakeNextRoundInfo(
+    int round,
+    std::map<short, TournamentInfo>& bracket) {
+    std::map<short, TournamentInfo> next;
+    for (int index = 0; 16 / round - 1 > index; index += 2) {
+        const short left_index = static_cast<short>(index);
+        const short right_index = static_cast<short>(index + 1);
+        TournamentInfo* selected = 0;
+        if (bracket[left_index].monsters_[0].monster_id) {
+            if (bracket[right_index].monsters_[0].monster_id) {
+                const unsigned int left_roll = get_rand_int(bracket[left_index].key_);
+                const unsigned int right_roll = get_rand_int(bracket[right_index].key_);
+                selected = left_roll <= right_roll
+                               ? &bracket[right_index]
+                               : &bracket[left_index];
+            } else {
+                selected = &bracket[right_index];
+            }
+        } else {
+            selected = &bracket[left_index];
+        }
+        selected->round_ = static_cast<short>(index / 2);
+        next.insert(std::make_pair(selected->round_, *selected));
+    }
+    bracket = next;
+    return 0;
+}
+
+// IDA_EA: 0x8304594
+// IDA_NAME: _ZN13CBattle_Field25MakeTournamentMonsterListERSt3mapIsSt6vectorINS_14TournamentInfoESaIS2_EESt4lessIsESaISt4pairIKsS4_EEERSt4listI11_mapMonsterSaISE_EE
+bool CBattle_Field::MakeTournamentMonsterList(
+    std::map<short, std::vector<TournamentInfo> >& rounds,
+    std::list<_mapMonster>& monsters) {
+    for (int round = 1; round <= 4; ++round) {
+        std::vector<TournamentInfo>& infos =
+            rounds[static_cast<short>(round)];
+        int opponent = -1;
+        for (int index = 0; index <= 15; ++index) {
+            if (!infos[index].monsters_[0].monster_id) {
+                opponent = (index & 1) ? index - 1 : index + 1;
+                break;
+            }
+        }
+        AddTournamentMonster(infos[opponent], monsters, round == 4);
+    }
+
+    int sequence = 0;
+    for (std::list<_mapMonster>::iterator it = monsters.begin();
+         it != monsters.end();
+         ++it) {
+        it->raw_2c = sequence++;
+    }
+    return false;
+}
+
+// IDA_EA: 0x8304718
+// IDA_NAME: _ZN13CBattle_Field20AddTournamentMonsterERKNS_14TournamentInfoERSt4listI11_mapMonsterSaIS4_EEb
+bool CBattle_Field::AddTournamentMonster(const TournamentInfo& info,
+                                         std::list<_mapMonster>& monsters,
+                                         bool final_round) {
+    const int member_count = party_ ? party_->get_member_count() : 0;
+    const int enemy_role_base = current_map_
+        ? current_map_->getTournamentEnemyRoleBase(member_count)
+        : 0;
+    for (int member = 0; member <= 1; ++member) {
+        _mapMonster source;
+        if (!info.monsters_[member].monster_id) {
+            continue;
+        }
+        source.map_index = info.monsters_[member].monster_id;
+        source.enabled = 1;
+        source.raw_08 = 0;
+        source.raw_0c = 0;
+        source.raw_10 = 1;
+        source.raw_14 = 1;
+        source.raw_18 = enemy_role_base + (final_round ? 3 : 0);
+        source.raw_1c = 0;
+        source.raw_20 = 0;
+        source.raw_28 = 100;
+        source.raw_2c = 0;
+        source.raw_30 = 0;
+        monsters.push_back(source);
+    }
+    return false;
+}
+
+// IDA_EA: 0x8300ED4
+CMap* CBattle_Field::getMap(int map_index) {
+    CMap* map = G_CDataManager()->find_map(map_index);
+    if (!map) {
+        MapInfo* const current = GetCurrentMapInfo();
+        LogManager::logFormat(
+            1,
+            "battle_field.cpp",
+            "const CMap* CBattle_Field::getMap(int)",
+            0x4a7,
+            "Find Map[%d] Error(In Map Maker)(%d/%d) [Map Kind : %s]",
+            current->map_index_,
+            current_position_.first,
+            current_position_.second,
+            current->completed_ ? "layeredMap" : "generalMap");
+        return 0;
+    }
+
+    if (get_dungeon_diff() != 4 || !map->heroes_mode_map_index_) {
+        return map;
+    }
+
+    MapInfo* const current = GetCurrentMapInfo();
+    current->map_index_ = map->heroes_mode_map_index_;
+    map = G_CDataManager()->find_map(current->map_index_);
+    if (!map) {
+        LogManager::logFormat(
+            1,
+            "battle_field.cpp",
+            "const CMap* CBattle_Field::getMap(int)",
+            0x4c4,
+            "Find Map[%d] Error(In Map Maker)(%d/%d) [Map Kind : %s]",
+            current->map_index_,
+            current_position_.first,
+            current_position_.second,
+            current->completed_ ? "layeredMap" : "generalMap");
+    }
+    return map;
+}
+
+// IDA_EA: 0x830107E
+CDungeonClearTracer* CBattle_Field::setDungeonClearTrace(
+    int map_id,
+    int max_boss_count,
+    int killed_boss_count,
+    int killed_monster_count) {
+    dungeon_clear_tracer_.SetMapId(map_id);
+    dungeon_clear_tracer_.SetMaxBossCount(max_boss_count);
+    dungeon_clear_tracer_.SetKilledBossCount(killed_boss_count);
+    return dungeon_clear_tracer_.SetKilledMonsterCount(killed_monster_count);
+}
+
+// IDA_EA: 0x83010EE
+int CBattle_Field::getAddChampionMobCnt() {
+    CMap* const map = current_map_;
+    if (!map) {
+        return -1;
+    }
+
+    const int map_width = map_width_;
+    const int map_height = map_height_;
+    if (!map_width && !map_height) {
+        LogManager::logFormat(
+            1,
+            "battle_field.cpp",
+            "int CBattle_Field::getAddChampionMobCnt()",
+            0x4ed,
+            "[FPE] [CBattle_Field::ConsistMap] Dungeon[%d] Width[%d] Height[%d]",
+            dungeon_index_,
+            map_width,
+            map_height);
+    }
+
+    int count = map->champion_;
+    int champion_rate = champion_spawn_rate_;
+    switch (get_dungeon_diff()) {
+        case 1:
+            champion_rate = 150 * champion_spawn_rate_ / 100;
+            break;
+        case 2:
+            champion_rate = 250 * champion_spawn_rate_ / 100;
+            break;
+        case 3:
+            champion_rate = 500 * champion_spawn_rate_ / 100;
+            break;
+        default:
+            break;
+    }
+    if (map->script_value_36e_ != 1u &&
+        map_width * map_height != 0) {
+        const int probability =
+            100 * champion_rate / (map_width * map_height);
+        if (probability > static_cast<int>(get_rand_int(100))) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// IDA_EA: 0x83012A4
+int CBattle_Field::get_monster_list(std::list<_mapMonster>& monsters) {
+    CDungeon* const dungeon = dungeon_;
+    CMap* const map = current_map_;
+    CParty* const party = party_;
+    if (!dungeon || !map || !party) {
+        return 0;
+    }
+
+    if (dungeon->isTournamentDungeon()) {
+        tournament_infos_.clear();
+        if (!ConsistTournament(map, monsters, tournament_infos_)) {
+            return 0;
+        }
+        dungeon_clear_tracer_.SetMaxBossCount(party->get_member_count());
+        SetTournamentCurRound(1);
+    } else {
+        monsters = map->get_monster_list();
+    }
+    return 1;
+}
+
+// IDA_EA: 0x83071BA
+int CBattle_Field::add_hell_party_monster(
+    map_monster& scratch,
+    int& next_unique_id,
+    int& source_sequence,
+    std::map<unsigned short, STHellPartyGroupOrder>* group_orders) {
+    MapInfo* const current = GetCurrentMapInfo();
+    current->monster_kill_counts_.clear();
+
+    const signed char difficulty = hell_party_difficulty_;
+    int accumulated_rate = 0;
+    for (std::map<unsigned short, STHellPartyGroupOrder>::iterator order =
+             group_orders->begin();
+         order != group_orders->end();
+         ++order) {
+        std::list<STHellPartyGroupRate> rates =
+            order->second.group_rates;
+        const int total_rate =
+            order->second.rates_by_group_order[difficulty];
+        const int selected_rate =
+            static_cast<int>(get_rand_int(total_rate));
+
+        for (std::list<STHellPartyGroupRate>::iterator rate =
+                 rates.begin();
+             rate != rates.end();
+             ++rate) {
+            if (rate->group_order !=
+                static_cast<unsigned char>(difficulty)) {
+                continue;
+            }
+            accumulated_rate += rate->rate;
+            if (accumulated_rate < selected_rate) {
+                continue;
+            }
+
+            stHellPartyMonsterGroupList* const group =
+                G_CDataManager()->find_hellparty_group(
+                    rate->group_index);
+            if (!group) {
+                LogManager::logFormat(
+                    1,
+                    "battle_field.cpp",
+                    "void CBattle_Field::add_hell_party_monster(map_monster&, int&, int&, MAP_HELL_PARTY_GROUP_ORDER*)",
+                    0x1076,
+                    "HELLPARTY_LOG : HELLPARTY GROUP INDEX (%d) , MAP INDEX (%d) : ADD HELL PARTY GROUP ERROR!!\n",
+                    rate->group_index,
+                    current->map_index_);
+                break;
+            }
+
+            int monster_count = 0;
+            while (group->monster_index[monster_count] > 0) {
+                scratch.spawn_sequence_ = source_sequence++;
+                scratch.hell_party_group_order_ = order->first;
+                scratch.hell_party_group_index_ =
+                    static_cast<unsigned short>(rate->group_index);
+                scratch.monster_level_ = static_cast<unsigned char>(
+                    dungeon_->get_standard_level());
+                scratch.monster_id_ =
+                    group->monster_index[monster_count];
+                scratch.monster_kind_ =
+                    group->monster_grade[monster_count] ? 5 : 0;
+                scratch.map_monster_unique_id_ = next_unique_id++;
+                scratch.assigned_team_ = 100;
+                scratch.packet_value_13_ = 1;
+                scratch.stage_monster_type_ = 0;
+                stHellParty_t* const hell_party =
+                    G_CDataManager()->get_hellparty_script_values();
+                scratch.specific_drop_count_ =
+                    hell_party->difficulty_value[difficulty];
+                scratch.random_drop_count_ = 1;
+                scratch.hell_party_difficulty_ =
+                    static_cast<unsigned char>(difficulty);
+                current->Add_Mob(scratch);
+                ++monster_count;
+            }
+            current->monster_kill_counts_.insert(
+                std::make_pair(rate->group_index,
+                               monster_count - 1));
+            accumulated_rate = 0;
+            break;
+        }
+    }
+    return 0;
+}
+
+// IDA_EA: 0x8301D76
+void CBattle_Field::add_monster_APC_AI(int& next_unique_id) {
+    CMap* const map = current_map_;
+    CDungeon* const dungeon = dungeon_;
+    if (!map || !dungeon) {
+        return;
+    }
+
+    int sequence = 0;
+    const std::vector<STAICharacterMapArrangeData>& arrangements =
+        map->getAICharacters();
+    if (arrangements.empty()) {
+        return;
+    }
+
+    map_monster scratch;
+    for (std::vector<STAICharacterMapArrangeData>::const_iterator it =
+             arrangements.begin();
+         it != arrangements.end();
+         ++it) {
+        CAICharacter* const character =
+            G_CDataManager()->get_ai_character_list()->get(
+                static_cast<unsigned int>(it->raw_00));
+        if (!character) {
+            LogManager::logFormat(
+                1,
+                "battle_field.cpp",
+                "void CBattle_Field::add_monster_APC_AI(int&)",
+                0x649,
+                "Unknown APC Type(%d). In Dungeon(%d), Map(%d) [Map Kind : %s]",
+                it->raw_00,
+                dungeon->get_index(),
+                map->get_index(),
+                GetCurrentMapInfo()->completed_
+                    ? "layeredMap"
+                    : "generalMap");
+            continue;
+        }
+
+        ResetMapMonsterForMapAssembly(scratch);
+        scratch.spawn_sequence_ = sequence;
+        scratch.monster_id_ = it->raw_00;
+        scratch.map_monster_unique_id_ = next_unique_id++;
+        scratch.monster_kind_ =
+            static_cast<signed char>(it->raw_14);
+        if (scratch.monster_kind_ == 8 &&
+            GetCurrentMapInfo()->dummy_boss_map_pending_ != 1) {
+            map_order_.push_back(
+                scratch.map_monster_unique_id_);
+        }
+        scratch.monster_level_ =
+            dungeon->get_dimension_possible() <= 0
+                ? static_cast<unsigned char>(character->getLevel())
+                : static_cast<unsigned char>(dimension_level_);
+        // IDA 0x8301D76 writes STAICharacterMapArrangeData+0x10 to
+        // map_monster+0x2c.  Preserve the script category generically:
+        // [monster]=100, [character]=0, [neutral]=200.  Fixed enemy APCs
+        // must remain team 100 so the authoritative death path can generate
+        // drops, while friendly/neutral scripted actors stay excluded.
+        scratch.assigned_team_ = it->raw_10;
+        scratch.specific_drop_count_ = it->raw_19;
+        scratch.random_drop_count_ = it->raw_18;
+        GetCurrentMapInfo()->Add_Mob(scratch);
+        ++sequence;
+    }
+}
+
+// IDA_EA: 0x83020B6
+void CBattle_Field::add_monster_APC_AI_by_rate(
+    map_monster& scratch,
+    int& next_unique_id,
+    int pos_x,
+    int pos_y) {
+    CDungeon* const dungeon = dungeon_;
+    if (!dungeon) {
+        return;
+    }
+    if ((maze_boss_position_.first == pos_x &&
+         maze_boss_position_.second == pos_y) ||
+        (maze_start_position_.first == pos_x &&
+         maze_start_position_.second == pos_y)) {
+        return;
+    }
+
+    const int rate = dungeon->ai_character_appear_rate_;
+    if (!rate ||
+        rate <= static_cast<int>(get_rand_int(100))) {
+        return;
+    }
+
+    CAICharacter* const character =
+        G_CDataManager()
+            ->get_ai_character_list()
+            ->getByLevel(
+                static_cast<unsigned int>(
+                    dungeon->get_standard_level()));
+    if (!character) {
+        return;
+    }
+
+    ResetMapMonsterForMapAssembly(scratch);
+    scratch.spawn_sequence_ = 64;
+    scratch.monster_id_ = character->getIdx();
+    scratch.map_monster_unique_id_ = next_unique_id++;
+    scratch.monster_kind_ = 5;
+    scratch.monster_level_ =
+        dungeon->get_dimension_possible() <= 0
+            ? static_cast<unsigned char>(character->getLevel())
+            : static_cast<unsigned char>(dimension_level_);
+    scratch.assigned_team_ = 100;
+    scratch.specific_drop_count_ = 0;
+    scratch.random_drop_count_ = 0;
+    GetCurrentMapInfo()->Add_Mob(scratch);
+}
+
+// IDA_EA: 0x83022A8
+bool CBattle_Field::add_monster_additional_champion(
+    std::vector<int>& candidates,
+    int additional_count) {
+    for (int count = 0; count < additional_count; ++count) {
+        if (candidates.empty()) {
+            break;
+        }
+        const unsigned int index =
+            static_cast<unsigned int>(std::rand()) %
+            candidates.size();
+        const int unique_id = candidates[index];
+        candidates.erase(candidates.begin() + index);
+
+        map_monster& monster =
+            GetCurrentMapInfo()->monsters_[unique_id];
+        if (monster.packet_value_13_) {
+            if (monster.monster_kind_ == 1) {
+                LogManager::logFormat(
+                    1,
+                    "battle_field.cpp",
+                    "void CBattle_Field::add_monster_additional_champion(std::vector<int, std::allocator<int> >&, int)",
+                    0x6bf,
+                    "Box Monster is Champion! id(%d)",
+                    unique_id);
+            }
+        } else {
+            monster.monster_kind_ = 1;
+        }
+    }
+    return true;
+}
+
+// IDA_EA: 0x83031D2
+// IDA_NAME: _ZN13CBattle_Field10ConsistMapEv
+// DEMANGLED: CBattle_Field::ConsistMap(void)
+int CBattle_Field::ConsistMap() {
+    CParty* const party = party_;
+    if (!party) {
+        return 0;
+    }
+
+    MapInfo* const current = GetCurrentMapInfo();
+    current_map_ = getMap(current->map_index_);
+    CMap* const map = current_map_;
+    if (!map) {
+        return 0;
+    }
+
+    setDungeonClearTrace(current->map_index_,
+        map->GetBossCount(),
+        0,
+        0);
+    if (!G_CDataManager()->find_dungeon(dungeon_index_)) {
+        LogManager::logFormat(
+            1,
+            "battle_field.cpp",
+            "void CBattle_Field::ConsistMap()",
+            0x7f2,
+            "G_CDataManager()->find_dungeon( %d) fail",
+            dungeon_index_);
+        return 0;
+    }
+
+    const int additional_champion_count =
+        getAddChampionMobCnt();
+    if (additional_champion_count < 0) {
+        return 0;
+    }
+
+    std::list<_mapMonster> source;
+    if (static_cast<unsigned char>(
+            get_monster_list(source)) != 1u) {
+        return 0;
+    }
+    if (!AppendGoldenCommerceCartProjection(
+            dungeon_index_, &source)) {
+        LogManager::logFormat(
+            1,
+            "battle_field.cpp",
+            "void CBattle_Field::ConsistMap()",
+            0x7f3,
+            "GOLDEN_COMMERCE_CART_PROJECTION_FAIL dungeon=%d map=%d",
+            dungeon_index_,
+            current->map_index_);
+        return 0;
+    }
+
+    int pos_x = -1;
+    int pos_y = -1;
+    getCurPosXY(pos_x, pos_y);
+    add_monster_list_bossroom_condition(source, pos_x, pos_y);
+
+    int normal_monster_count = 0;
+    map_monster scratch;
+    std::vector<int> champion_candidates;
+    int source_sequence = 0;
+    int next_monster_unique_id =
+        static_cast<int>(get_rand_int(60000));
+    add_monsters_current_map(
+        source,
+        champion_candidates,
+        scratch,
+        normal_monster_count,
+        next_monster_unique_id,
+        source_sequence);
+
+    bool hell_party_generated = false;
+    add_monster_hell_party(
+        scratch,
+        hell_party_generated,
+        next_monster_unique_id,
+        source_sequence);
+    if (static_cast<unsigned char>(
+            add_monster_blood(
+                scratch,
+                next_monster_unique_id,
+                source_sequence)) != 1u) {
+        return 0;
+    }
+
+    dungeon_clear_tracer_.SetMaxMonsterCount(normal_monster_count);
+    add_monster_APC_AI(next_monster_unique_id);
+    add_monster_APC_AI_by_rate(
+        scratch,
+        next_monster_unique_id,
+        pos_x,
+        pos_y);
+    add_monster_additional_champion(
+        champion_candidates,
+        additional_champion_count);
+    // CLIENT_IDA_EVIDENCE: START_MAP sends no_hit ? 3 : monster_kind.
+    // Record every Named/Champion object after random promotion so a later
+    // NOTI38/CMD33 trace can be joined by the stable per-map unique ID.
+    for (std::map<int, map_monster>::iterator monster_it =
+             current->monsters_.begin();
+         monster_it != current->monsters_.end(); ++monster_it) {
+        map_monster& monster = monster_it->second;
+        const bool server_named = monster.isNamedMonster();
+        const bool server_apc = monster.monster_kind_ >= 5 &&
+                                monster.monster_kind_ <= 8;
+        if (!server_named && monster.monster_kind_ != 1 &&
+            monster.monster_kind_ != 2 && !server_apc) {
+            continue;
+        }
+        const int wire_kind = monster.no_hit_animation_
+            ? 3
+            : static_cast<int>(monster.monster_kind_);
+        LogManager::logFormat(
+            1,
+            "quest_monster_diag.cpp",
+            "int CBattle_Field::ConsistMap()",
+            0,
+            "[QUEST_MONSTER][SPAWN] dungeon=%d difficulty=%d map=%d uid=%d template=%d kind=%d wire_kind=%d named=%d no_hit=%u team=%d packet_value=%u",
+            dungeon_index_,
+            get_dungeon_diff(),
+            current->map_index_,
+            monster.map_monster_unique_id_,
+            monster.monster_id_,
+            static_cast<int>(monster.monster_kind_),
+            wire_kind,
+            server_named ? 1 : 0,
+            static_cast<unsigned int>(monster.no_hit_animation_),
+            monster.assigned_team_,
+            static_cast<unsigned int>(monster.packet_value_13_));
+    }
+    add_monster_event(next_monster_unique_id, pos_x, pos_y);
+    set_monster_ability();
+    insert_tournamentRoundMonster();
+
+    int next_item_unique_id =
+        static_cast<int>(get_rand_int(60000));
+    add_item_curr_map(next_item_unique_id, next_monster_unique_id);
+    current->next_drop_item_unique_id_ =
+        next_item_unique_id;
+    const unsigned int drop_limit =
+        map->max_monster_drop_exception_
+            ? static_cast<unsigned int>(map->max_monster_drop_exception_)
+            : G_CDataManager()->get_server_parameter_script()
+                  ->get_max_monster_drop_per_map();
+    current->SelectDonsterItemDropLimit(drop_limit);
+    return 1;
+}
+
+// IDA_EA: 0x83023EC
+int CBattle_Field::add_monster_event(int& next_unique_id,
+                                     int pos_x,
+                                     int pos_y) {
+    CDungeon* const dungeon = dungeon_;
+    CMap* const map = current_map_;
+    if (!dungeon || !map || event_monsters_.empty()) {
+        return 0;
+    }
+
+    int attempted_count = 0;
+    const int existing_monster_count =
+        static_cast<int>(
+            GetCurrentMapInfo()->monsters_.size());
+    unsigned int spawn_sequence = 10000;
+    const std::vector<stEventMonsterStatus_t>& statuses = event_monsters_;
+    for (std::vector<stEventMonsterStatus_t>::const_iterator
+             status = statuses.begin();
+         status != statuses.end();
+         ++status) {
+        if (status->map_position.first != pos_x ||
+            status->map_position.second != pos_y) {
+            continue;
+        }
+        if (map->event_monster_positions_.empty()) {
+            return 0;
+        }
+
+        for (int index = 0;
+             index < status->status_value;
+             ++index) {
+            map_monster monster;
+            monster.monster_id_ = status->monster_id;
+            monster.monster_level_ =
+                static_cast<unsigned char>(
+                    dungeon->get_standard_level());
+            monster.spawn_sequence_ =
+                static_cast<int>(spawn_sequence);
+            monster.specific_drop_count_ =
+                static_cast<unsigned char>(
+                    status->status_second);
+            monster.random_drop_count_ =
+                static_cast<unsigned char>(
+                    status->status_first);
+            monster.monster_kind_ = 0;
+            monster.packet_value_13_ = 0;
+            monster.stage_monster_type_ = 0;
+            monster.assigned_team_ = 100;
+            monster.no_hit_animation_ = 0;
+            monster.counted_by_map_info_ = 1;
+            if (attempted_count < existing_monster_count) {
+                monster.map_monster_unique_id_ =
+                    next_unique_id++;
+                GetCurrentMapInfo()->Add_Mob(monster);
+                ++spawn_sequence;
+                if (spawn_sequence >=
+                    map->event_monster_positions_.size() + 10000u) {
+                    spawn_sequence = 10000;
+                }
+            }
+            ++attempted_count;
+        }
+    }
+    return 1;
+}
+
+// IDA_EA: 0x83026DA
+char CBattle_Field::set_monster_ability() {
+    CDungeon* const dungeon = dungeon_;
+    if (!dungeon) {
+        return 0;
+    }
+
+    MapInfo* const current = GetCurrentMapInfo();
+    current->random_map_seed_ = std::rand();
+    std::srand(
+        static_cast<unsigned int>(current->random_map_seed_));
+    for (std::map<int, map_monster>::iterator it =
+             current->monsters_.begin();
+         it != current->monsters_.end();
+         ++it) {
+        map_monster& monster = it->second;
+        if (monster.monster_kind_ > 4) {
+            continue;
+        }
+
+        CMonster* const source =
+            G_CDataManager()->find_monster(monster.monster_id_);
+        if (!source) {
+            continue;
+        }
+        STMonsterScript* const script =
+            source->getMonsterScript();
+        setBasicAbilityByLevel(
+            script,
+            &monster.active_static_info_,
+            monster.monster_level_,
+            dungeon_index_,
+            monster.monster_kind_,
+            false,
+            false);
+        upgradeAbilityByMonsterParameterCategory(
+            &script->parameter_categories,
+            &monster.active_static_info_,
+            monster.monster_kind_ == 3);
+        upgradeAbilityByDifficultyOfDungeon(
+            get_dungeon_diff(),
+            &monster.active_static_info_,
+            monster.monster_level_,
+            dungeon->monster_difficulty_bonus_);
+
+        if (monster.monster_kind_ == 3) {
+            upgradeAbilityByBossFeature(
+                &monster.active_static_info_);
+        } else if (monster.monster_kind_ == 1 ||
+                   monster.monster_kind_ == 2) {
+            const int champion_element =
+                getRandomChampionElement(
+                    script, current->random_map_seed_);
+            std::vector<int> features;
+            makeChampionFeatureList(
+                monster.related_monster_ids_,
+                monster.monster_level_,
+                current->random_map_seed_,
+                features,
+                get_dungeon_diff());
+            upgradeAbilityByChampionFeature(
+                champion_element,
+                monster.monster_kind_,
+                &features,
+                &monster.active_static_info_);
+        }
+    }
+    return 1;
+}
+
+// IDA_EA: 0x83029B8
+char CBattle_Field::insert_tournamentRoundMonster() {
+    CDungeon* const dungeon = dungeon_;
+    CParty* const party = party_;
+    if (!dungeon || !party ||
+        !dungeon->isTournamentDungeon()) {
+        return 0;
+    }
+
+    MapInfo* const current = GetCurrentMapInfo();
+    std::map<int, map_monster>::iterator source =
+        current->monsters_.begin();
+    const int member_count = party->get_member_count();
+    for (int round = 1; round <= 4; ++round) {
+        for (int member = 0;
+             member < member_count;
+             ++member) {
+            if (source == current->monsters_.end()) {
+                break;
+            }
+            current->repeated_monsters_.insert(*source);
+            ++source;
+        }
+    }
+    return 1;
+}
+
+// IDA_EA: 0x8302BC6
+int CBattle_Field::add_item_curr_map(int& next_item_unique_id,
+                                     int& next_monster_unique_id) {
+    CDungeon* const dungeon = dungeon_;
+    CMap* const map = current_map_;
+    if (!dungeon || !map) {
+        return 0;
+    }
+
+    MapInfo* const current = GetCurrentMapInfo();
+    current->next_monster_unique_id_ =
+        next_monster_unique_id;
+    const std::list<_mapItem> map_items =
+        map->get_item_list();
+    std::list<_mapItem>::const_iterator source =
+        map_items.begin();
+    const std::vector<stDungeonAssignItem_t>& assigned_items =
+        dungeon->getSpecialPassiveObjectItems();
+
+    WongWork::stGenerateRefData_t random_reference;
+    WongWork::stGenerateRefData_t object_reference;
+    WongWork::stGenerateRefData_t dungeon_reference;
+    random_reference.generator_data.object_random_drop.dungeon_difficulty =
+        static_cast<unsigned char>(get_dungeon_diff());
+    random_reference.generator_data.object_random_drop.party_member_count =
+        1;
+    dungeon_reference.generator_data.dungeon_drop.items =
+        const_cast<std::vector<std::pair<int, int> >*>(
+            &dungeon->getObjectDropItems());
+
+    while (source != map_items.end() &&
+           instance_dungeon_mode_ != 1) {
+        if (source->raw_00 >= assigned_items.size()) {
+            LogManager::logFormat(
+                1,
+                "battle_field.cpp",
+                "void CBattle_Field::add_item_curr_map(int&, int&)",
+                0x7a5,
+                "Dungeon passive object index error! Map id:%d, DungeonAssignItem size:%d, Passive object id:%d",
+                current->map_index_,
+                static_cast<int>(assigned_items.size()),
+                source->raw_00);
+            return 0;
+        }
+
+        const stDungeonAssignItem_t& assigned =
+            assigned_items.at(source->raw_00);
+        unsigned char standard_level = 0;
+        if (assigned.dungeon_index == -1) {
+            const int level =
+                dungeon->get_dimension_possible() <= 0
+                    ? dungeon->get_standard_level()
+                    : dimension_level_;
+            if (dungeon->get_standard_level() <= 0 ||
+                dungeon->get_standard_level() > 200) {
+                continue;
+            }
+            standard_level =
+                static_cast<unsigned char>(level);
+        } else {
+            standard_level =
+                static_cast<unsigned char>(
+                    assigned.dungeon_index);
+        }
+
+        WongWork::stGenerateResult_t generated;
+        random_reference.generator_data.object_random_drop.character_level =
+            standard_level;
+        random_reference.generator_data.object_random_drop.item_count =
+            static_cast<signed char>(source->item_count);
+        object_reference.generator_data.object_drop.items =
+            const_cast<std::list<std::pair<int, int> >*>(
+                &assigned.items);
+        object_reference.generator_data.object_drop.standard_level =
+            standard_level;
+        object_reference.generator_data.object_drop.item_count =
+            static_cast<signed char>(source->item_id);
+
+        WongWork::CItemGeneratorMgr* const manager =
+            G_CDataManager()->getItemGenerator();
+        manager
+            ->getGenerator(
+                WongWork::CItemGeneratorMgr::kObjectDrop)
+            ->generateRandomItem(random_reference, generated);
+        manager
+            ->getGenerator(
+                WongWork::CItemGeneratorMgr::kObjectDrop)
+            ->generateSpecificItem(object_reference, generated);
+        manager
+            ->getGenerator(
+                WongWork::CItemGeneratorMgr::kDungeonDrop)
+            ->generateSpecificItem(dungeon_reference, generated);
+
+        for (std::vector<Inven_Item>::const_iterator item =
+                 generated.items.begin();
+             item != generated.items.end();
+             ++item) {
+            map_item map_item_value;
+            map_item_value.routing_eligible_ = 1;
+            map_item_value.unique_id_ =
+                static_cast<unsigned int>(
+                    next_item_unique_id++);
+            map_item_value.packet_value_01_ =
+                static_cast<signed char>(source->drop_id);
+            map_item_value.item = *item;
+            current->Add_Item(map_item_value);
+        }
+        ++source;
+    }
+    return 1;
+}
+
+// IDA_EA: 0x8301B8C
+// IDA_NAME: _ZN13CBattle_Field22add_monster_hell_partyER11map_monsterRbRiS3_
+// DEMANGLED: CBattle_Field::add_monster_hell_party(map_monster &,bool &,int &,int &)
+int CBattle_Field::add_monster_hell_party(map_monster& scratch,
+                                          bool& generated,
+                                          int& next_unique_id,
+                                          int& source_sequence) {
+    (void)generated;
+    if (!hell_party_enabled_) {
+        return 0;
+    }
+
+    MapInfo* const current = GetCurrentMapInfo();
+    std::map<unsigned short, STHellPartyGroupOrder>* const group_orders =
+        G_CDataManager()->get_hellparty_groupOrder_map(current->map_index_);
+    if (!group_orders) {
+        return 0;
+    }
+    return add_hell_party_monster(
+        scratch, next_unique_id, source_sequence, group_orders);
+}
+
+// IDA_EA: 0x8304804
+// IDA_NAME: _ZN13CBattle_Field17add_blood_monsterER11map_monsterRiS2_St6vectorI19STAssignBloodSystemSaIS4_EES3_I22STAssignBloodPhaseTimeSaIS7_EE
+// DEMANGLED: CBattle_Field::add_blood_monster(map_monster &,int &,int &,std::vector<STAssignBloodSystem,std::allocator<STAssignBloodSystem>>,std::vector<STAssignBloodPhaseTime,std::allocator<STAssignBloodPhaseTime>>)
+int CBattle_Field::add_blood_monster(
+    map_monster& scratch,
+    int& next_unique_id,
+    int& source_sequence,
+    std::vector<STAssignBloodSystem> systems,
+    std::vector<STAssignBloodPhaseTime> phases) {
+    if (phases.empty() || systems.empty()) {
+        return 0;
+    }
+
+    short previous_phase = -1;
+    short small_round = 0;
+    const int system_count = static_cast<int>(systems.size());
+    short selected_blood_phase = 0;
+    if (current_map_) {
+        selected_blood_phase = static_cast<short>(
+            get_rand_int(current_map_->get_map_type() == 1 ? 4 : 5));
+    }
+    if (dungeon_->blood_dungeon_type_ == 2) {
+        selected_blood_phase = -1;
+    }
+
+    for (std::vector<STAssignBloodPhaseTime>::iterator phase =
+             phases.begin();
+         phase != phases.end();
+         ++phase, ++small_round) {
+        int system_index = phase->monster_id;
+        if (system_index == -1) {
+            system_index = static_cast<int>(get_rand_int(system_count - 1));
+            blood_rounds_.push_back(static_cast<short>(system_index));
+        }
+
+        STAssignBloodSystem& system = systems[system_index];
+        int phase_monster_count = system.value_1c;
+        int total_monster_count = 0;
+        for (int index = 0; index < system.value_24; ++index) {
+            const int count = phase_monster_count + index * system.value_20;
+            total_monster_count += count;
+        }
+        phase_monster_count = total_monster_count;
+        blood_flags_.push_back(false);
+
+        unsigned char blood_variant = 19;
+        if (previous_phase != phase->phase) {
+            if (selected_blood_phase == phase->phase) {
+                const unsigned int roll = get_rand_int(100);
+                if (roll <= 39) {
+                    blood_variant = static_cast<unsigned char>(get_rand_int(5));
+                } else if (roll <= 69) {
+                    blood_variant = static_cast<unsigned char>(get_rand_int(6) + 5);
+                } else if (roll <= 84) {
+                    blood_variant = static_cast<unsigned char>(get_rand_int(4) + 11);
+                } else if (roll <= 94) {
+                    blood_variant = static_cast<unsigned char>(get_rand_int(3) + 15);
+                } else {
+                    blood_variant = 18;
+                }
+                blood_spawn_runtime_.selected_small_round =
+                    static_cast<uint16_t>(small_round);
+                blood_spawn_runtime_.selected_system_monster_id = system.monster_id;
+                blood_spawn_runtime_.selected_variant = blood_variant;
+            }
+            previous_phase = static_cast<short>(phase->phase);
+        }
+
+        for (int monster = 0; monster < phase_monster_count; ++monster) {
+            scratch.spawn_sequence_ = source_sequence++;
+            scratch.monster_id_ = system.monster_id;
+            scratch.monster_level_ =
+                dungeon_->blood_dungeon_type_ == 2 ? 70 : 60;
+            scratch.monster_kind_ = 0;
+            scratch.blood_variant_ = blood_variant;
+            scratch.map_monster_unique_id_ = next_unique_id++;
+            scratch.assigned_team_ = 100;
+            scratch.specific_drop_count_ = 0;
+            scratch.random_drop_count_ = 0;
+            scratch.packet_value_13_ = 0;
+            scratch.stage_monster_type_ = 0;
+            scratch.no_hit_animation_ = 0;
+            scratch.blood_small_round_order_ =
+                static_cast<uint16_t>(small_round);
+            scratch.blood_spawn_rate_per_mille_ =
+                static_cast<uint16_t>(phase->rate * 1000.0f);
+            scratch.blood_system_value_08_ =
+                static_cast<uint16_t>(system.value_08);
+            scratch.blood_system_value_0c_ =
+                static_cast<uint16_t>(system.value_0c);
+            scratch.blood_system_value_10_ =
+                static_cast<uint16_t>(system.value_10);
+            scratch.blood_runtime_flag_ = 0;
+            scratch.blood_round_ = static_cast<uint16_t>(phase->phase);
+            scratch.blood_round_difficulty_ = phase->enabled;
+            GetCurrentMapInfo()->Add_Mob(scratch);
+            blood_variant = 19;
+        }
+
+        if (!G_CDataManager()->find_monster(system.monster_id)) {
+            return 0;
+        }
+    }
+    blood_round_.setBloodLastSmallRoundOrder(small_round - 1);
+    return 1;
+}
+
+// IDA_EA: 0x8301BF6
+// IDA_NAME: _ZN13CBattle_Field17add_monster_bloodER11map_monsterRiS2_
+// DEMANGLED: CBattle_Field::add_monster_blood(map_monster &,int &,int &)
+int CBattle_Field::add_monster_blood(map_monster& scratch,
+                                     int& next_unique_id,
+                                     int& source_sequence) {
+    CMap* const map = current_map_;
+    if (!map) {
+        return 0;
+    }
+    if (map->blood_phase_times_.empty()) {
+        return 1;
+    }
+
+    blood_systems_ = map->blood_systems_;
+    blood_phase_times_ = map->blood_phase_times_;
+    if (add_blood_monster(scratch,
+                          next_unique_id,
+                          source_sequence,
+                          blood_systems_,
+                          blood_phase_times_)) {
+        return 1;
+    }
+    LogManager::logFormat(
+        1,
+        "battle_field.cpp",
+        "bool CBattle_Field::add_monster_blood(map_monster&, int&, int&)",
+        0x62b,
+        "BLOOD_LOG : MONSTERS SETTING ERROR!!\n");
+    return 0;
+}
+
+// IDA_EA: 0x83013E2
+// IDA_NAME: _ZN13CBattle_Field35add_monster_list_bossroom_conditionERSt4listI11_mapMonsterSaIS1_EEii
+// DEMANGLED: CBattle_Field::add_monster_list_bossroom_condition(std::list<_mapMonster,std::allocator<_mapMonster>> &,int,int)
+int CBattle_Field::add_monster_list_bossroom_condition(
+    std::list<_mapMonster>& monsters,
+    int pos_x,
+    int pos_y) {
+    if (!dungeon_ || !current_map_ ||
+        dungeon_->enter_boss_room_condition_.enabled != 1) {
+        return 0;
+    }
+
+    for (std::vector<stConditionEnterBossRoomStatus_t>::const_iterator
+             status = boss_room_conditions_.begin();
+         status != boss_room_conditions_.end();
+         ++status) {
+        for (std::vector<std::pair<int, int> >::const_iterator position =
+                 status->condition_values.begin();
+             position != status->condition_values.end();
+             ++position) {
+            if (position->first != pos_x || position->second != pos_y) {
+                continue;
+            }
+            const std::list<_mapMonster> conditions =
+                current_map_->get_condition_monster_list();
+            for (std::list<_mapMonster>::const_iterator monster =
+                     conditions.begin();
+                 monster != conditions.end();
+                 ++monster) {
+                if (monster->map_index == status->condition_type) {
+                    monsters.push_back(*monster);
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+// IDA_EA: 0x830162E
+// IDA_NAME: _ZN13CBattle_Field24add_monsters_current_mapERSt4listI11_mapMonsterSaIS1_EERSt6vectorIiSaIiEER11map_monsterRiSB_SB_
+// DEMANGLED: CBattle_Field::add_monsters_current_map(std::list<_mapMonster,std::allocator<_mapMonster>> &,std::vector<int,std::allocator<int>> &,map_monster &,int &,int &,int &)
+char CBattle_Field::add_monsters_current_map(
+    std::list<_mapMonster>& source,
+    std::vector<int>& champion_candidates,
+    map_monster& scratch,
+    int& normal_monster_count,
+    int& next_unique_id,
+    int& source_sequence) {
+    if (!dungeon_) {
+        return 0;
+    }
+
+    MapInfo* const current = GetCurrentMapInfo();
+    for (std::list<_mapMonster>::const_iterator it = source.begin();
+         it != source.end();
+         ++it) {
+        if (!dungeon_->named_monster_positions_.empty() && it->raw_1c &&
+            checkClearedNamedMonsterMap(
+                static_cast<unsigned char>(it->raw_20), it->map_index)) {
+            continue;
+        }
+
+        int spawn_count = 0;
+        switch (it->raw_0c) {
+            case 0:
+                spawn_count = 1;
+                break;
+            case 1:
+                spawn_count = party_member_count_ <= 2 ? 1 : 2;
+                break;
+            case 2:
+                spawn_count = party_member_count_;
+                break;
+            default:
+                break;
+        }
+
+        for (int spawn = 0; spawn < spawn_count; ++spawn) {
+            scratch.spawn_sequence_ = it->raw_2c;
+            if (village_monster_uid_ && party_) {
+                scratch.monster_level_ =
+                    ClampMonsterLevel(party_->getMemberMaxLevel());
+            } else if (it->enabled) {
+                const int level = dungeon_->get_dimension_possible() <= 0
+                                      ? it->raw_08 + dungeon_->get_standard_level()
+                                      : dimension_level_;
+                scratch.monster_level_ = ClampMonsterLevel(level);
+            } else {
+                scratch.monster_level_ = static_cast<unsigned char>(
+                    dungeon_->get_dimension_possible() <= 0
+                        ? it->raw_08
+                        : dimension_level_);
+            }
+
+            if (it->map_index == -1) {
+                scratch.monster_id_ =
+                    G_CDataManager()
+                        ->get_boss_consist_monster_manager()
+                        ->get_levelrandom_mob(scratch.monster_level_);
+                LogManager::logFormat(
+                    1,
+                    "battle_field.cpp",
+                    "void CBattle_Field::add_monsters_current_map(MOB_REF_LIST&, std::vector<int, std::allocator<int> >&, map_monster&, int&, int&, int&)",
+                    0x5c0,
+                    "HEROES_LOG : RANDOM MONSTER INDEX (%d) MONSTER LEVEL (%d) MAP INDEX (%d) [Map Kind : %s]\n",
+                    scratch.monster_id_,
+                    scratch.monster_level_,
+                    current->map_index_,
+                    current->completed_ ? "layeredMap" : "generalMap");
+            } else {
+                scratch.monster_id_ = it->map_index;
+            }
+
+            scratch.specific_drop_count_ =
+                static_cast<unsigned char>(it->raw_10);
+            scratch.random_drop_count_ =
+                static_cast<unsigned char>(it->raw_14);
+            scratch.monster_kind_ = static_cast<signed char>(it->raw_18);
+            scratch.map_monster_unique_id_ = next_unique_id++;
+            scratch.runtime_value_20_ = 0;
+            scratch.sdc_damaged_packet_count_ = 0;
+            const bool is_golden_cart = IsGoldenCommerceCartProjection(
+                dungeon_index_, scratch.monster_id_);
+            if (!is_golden_cart && scratch.monster_kind_ == 0 &&
+                !scratch.isNamedMonster() &&
+                dungeon_->isTournamentDungeon() != 1) {
+                champion_candidates.push_back(scratch.map_monster_unique_id_);
+            }
+            scratch.packet_value_13_ = it->raw_1c;
+            scratch.stage_monster_type_ =
+                static_cast<unsigned char>(it->raw_20);
+            scratch.related_monster_ids_ = it->raw_34;
+            scratch.assigned_team_ = it->raw_28;
+            scratch.no_hit_animation_ = it->raw_30;
+            current->Add_Mob(scratch);
+            if (!is_golden_cart && !scratch.packet_value_13_) {
+                ++normal_monster_count;
+            }
+            if (scratch.monster_kind_ == 3 &&
+                current->dummy_boss_map_pending_ != 1) {
+                map_order_.push_back(scratch.map_monster_unique_id_);
+            }
+        }
+        ++source_sequence;
+    }
+    return 1;
+}

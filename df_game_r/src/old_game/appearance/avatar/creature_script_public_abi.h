@@ -1,0 +1,6 @@
+#ifndef OLDSRV_GLOBAL_CREATURE_SCRIPT_PUBLIC_ABI_H_
+#define OLDSRV_GLOBAL_CREATURE_SCRIPT_PUBLIC_ABI_H_
+
+#include "old_data/PVF/creature/creature_script.h"
+
+#endif  // OLDSRV_GLOBAL_CREATURE_SCRIPT_PUBLIC_ABI_H_

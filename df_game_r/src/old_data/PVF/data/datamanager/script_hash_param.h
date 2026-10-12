@@ -1,0 +1,6 @@
+#ifndef OLDSRV_DATAMANAGER_SCRIPT_HASH_PARAM_H_
+#define OLDSRV_DATAMANAGER_SCRIPT_HASH_PARAM_H_
+
+#include "old_data/PVF/data/script_hash_param.h"
+
+#endif  // OLDSRV_DATAMANAGER_SCRIPT_HASH_PARAM_H_

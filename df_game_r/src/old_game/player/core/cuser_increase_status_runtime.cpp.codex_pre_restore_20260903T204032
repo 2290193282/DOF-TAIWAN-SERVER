@@ -1,0 +1,739 @@
+#include "old_game/player/core/cuser.h"
+
+#include "common/config.h"
+#include "old_game/progression/skill/create_character_skill_abi.h"
+
+#include "old_game/activity/reward/event_base.h"
+#include "old_game/activity/reward/event_manager_abi.h"
+#include "common/manager/game_manager.h"
+#include "common/manager/global_data.h"
+#include "common/manager/global_lifecycle.h"
+#include "old_game/social/guild/guild_server_proxy_abi.h"
+#include "infra/security/policy/secu_protection_field_abi.h"
+#include "infra/log/format/trace.h"
+#include "old_data/PVF/data/data_manager.h"
+#include "old_data/PVF/etc/guild_parameter_script.h"
+#include "old_data/PVF/pvp_mission/pvp_skill_tree_parameter_script.h"
+#include "old_game/pvp/battlefield/war_room.h"
+#include "old_game/social/party/party.h"
+#include "old_game/economy/mall/quest_shop_runtime.h"
+#include "old_game/progression/career/premium_lethe_manager.h"
+#include "old_game/progression/quest/quest_runtime.h"
+#include "old_game/progression/quest/quest_skill_expert_job.h"
+#include "old_game/progression/skill/skill_changer_runtime.h"
+#include "old_game/player/core/character_growth_tables.h"
+#include "old_game/world/region/game_world.h"
+#include "infra/network/packet/PacketEnum.h"
+#include "infra/network/packet/packet_guard.h"
+
+#include <stdint.h>
+
+#include <utility>
+#include <vector>
+
+
+namespace {
+
+const ENUM_CMDPACKET kUseStatusCommand = ENUM_CMDPACKET_INCREASE_STATUS;
+const ENUM_PREMIUM_TYPE kOneDayLethePremium =
+    static_cast<ENUM_PREMIUM_TYPE>(33);
+const ENUM_SKILL_TREE_KIND kCurrentSkillTree = ENUM_SKILL_TREE_CURRENT;
+const ENUM_SKILL_TREE_KIND kFirstSkillTree = ENUM_SKILL_TREE_0;
+const ENUM_SKILL_TREE_KIND kSecondSkillTree = ENUM_SKILL_TREE_1;
+
+void SendStatusPacket(CUser* user,
+                      PacketGuard& packet,
+                      short slot,
+                      int status,
+                      int value,
+                      short previous_level = 0,
+                      short gained_level = 0) {
+    packet.clear();
+    packet.put_header(1, ENUM_CMDPACKET_INCREASE_STATUS);
+    packet.put_byte(1);
+    packet.put_short(slot);
+    packet.put_byte(status);
+    packet.put_int(value);
+    packet.put_short(previous_level);
+    packet.put_short(gained_level);
+    packet.finalize(true);
+    user->Send(packet);
+}
+
+void SendBasicInfo(CUser* user, PacketGuard& packet) {
+    packet.clear();
+    packet.put_header(0, 2);
+    packet.put_byte(1);
+    packet.put_short(1);
+    user->make_basic_info(packet, 1);
+    packet.finalize(true);
+}
+
+void SendCompletionAndBroadcast(CUser* user,
+                                PacketGuard& packet,
+                                short slot,
+                                int status,
+                                int value) {
+    SendStatusPacket(user, packet, slot, status, value);
+
+    if (user->get_state() == 5) {
+        CParty* const party = user->GetParty();
+        if (party) {
+            SendBasicInfo(user, packet);
+            party->send_to_party(packet);
+        }
+    } else if (user->get_state() == 8) {
+        WarRoom* const room = user->GetWarRoom();
+        if (room) {
+            SendBasicInfo(user, packet);
+            room->SendToRoom(packet);
+        }
+    }
+}
+
+bool ApplyGiveSkills(CUser* user,
+                     ENUM_SKILL_TREE_KIND first_tree,
+                     ENUM_SKILL_TREE_KIND second_tree,
+                     bool both_trees,
+                     int changer_target,
+                     int status_for_log) {
+    CCharacList* const character_list = G_CDataManager()->get_character_list();
+    CCharacter* const character =
+        &character_list->characters_[user->get_charac_job()];
+    std::vector<std::pair<int, int> > skills;
+    if (character->get_give_skill(user->getCurCharFirstGrowType(),
+                                  user->getCurCharSecondGrowType(),
+                                  skills,
+                                  0) != 1) {
+        LogManager::logFormat(
+            1,
+            "user.cpp",
+            "void CUser::increase_status(short int)",
+            both_trees ? 0x4aee : 0x4b48,
+            "User %s - CUser::set_grow_type %d",
+            user->getCurCharacName(),
+            status_for_log);
+        return false;
+    }
+
+    SkillSlot* const skill_slot = user->getCurCharacSkillW();
+    for (std::vector<std::pair<int, int> >::const_iterator iter =
+             skills.begin();
+         iter != skills.end();
+         ++iter) {
+        skill_slot->growtype_skill(user->get_charac_job(),
+                                   iter->first,
+                                   iter->second,
+                                   first_tree);
+        if (both_trees) {
+            skill_slot->growtype_skill(user->get_charac_job(),
+                                       iter->first,
+                                       iter->second,
+                                       second_tree);
+        }
+    }
+
+    STExpertJobScript* const expert_job = G_CDataManager()->GetExpertJobScript(
+        user->GetCurCharacExpertJobType());
+    if (expert_job) {
+        for (std::vector<std::pair<int, int> >::const_iterator iter =
+                 expert_job->unknown_exp_pairs.begin();
+             iter != expert_job->unknown_exp_pairs.end();
+             ++iter) {
+            const int level = user->GetCurExpertJobLevel(
+                user->GetCurCharacExpertJobExp());
+            skill_slot->growtype_skill(user->get_charac_job(),
+                                       iter->first,
+                                       level,
+                                       first_tree);
+            if (both_trees) {
+                skill_slot->growtype_skill(user->get_charac_job(),
+                                           iter->first,
+                                           level,
+                                           second_tree);
+            }
+        }
+    }
+
+    WongWork::CSkillChanger skill_changer;
+    skill_changer.SkillInitialize(user, changer_target, false);
+    user->send_skill_info();
+    return true;
+}
+
+void UpdateLetheState(CUser* user,
+                      CPremiumLetheManager* lethe,
+                      bool both_trees,
+                      ENUM_SKILL_TREE_KIND tree) {
+    if (!lethe) {
+        return;
+    }
+    if (user->isAffectedPremium(kOneDayLethePremium)) {
+        if (both_trees) {
+            lethe->InitLetheSkill(user, kFirstSkillTree);
+            lethe->InitLetheSkill(user, kSecondSkillTree);
+        } else {
+            lethe->InitLetheSkill(user, tree);
+        }
+        return;
+    }
+    if (both_trees) {
+        lethe->UpdateBackupSkillFlag(user, kFirstSkillTree);
+        lethe->UpdateBackupSkillFlag(user, kSecondSkillTree);
+    } else {
+        lethe->UpdateBackupSkillFlag(user, tree);
+    }
+}
+
+bool ResetNormalSkills(CUser* user, bool both_trees, int status_for_log) {
+    SkillSlot* const skill_slot = user->getCurCharacSkillW();
+    const ENUM_SKILL_TREE_KIND current_tree = static_cast<ENUM_SKILL_TREE_KIND>(
+        user->GetCurCharacSkillTreeIndex());
+    const ENUM_SKILL_TREE_KIND target_tree =
+        current_tree == ENUM_SKILL_TREE_CURRENT || current_tree == kFirstSkillTree
+            ? kFirstSkillTree
+            : kSecondSkillTree;
+
+    if (both_trees) {
+        skill_slot->clear_all_skills_both();
+        skill_slot->set_parent(user);
+        addSkillOnCreateCharacter(
+            skill_slot->get_mastered_skill_tree(kFirstSkillTree),
+            user->get_charac_job());
+        addSkillOnCreateCharacter(
+            skill_slot->get_mastered_skill_tree(kSecondSkillTree),
+            user->get_charac_job());
+    } else {
+        skill_slot->clear_all_skills(target_tree);
+        skill_slot->set_parent(user);
+        addSkillOnCreateCharacter(skill_slot->get_mastered_skill_tree(target_tree),
+                                  user->get_charac_job());
+    }
+
+    const int changer_target = both_trees ? 0 :
+        (target_tree == kFirstSkillTree ? 1 : 2);
+    if (!ApplyGiveSkills(user,
+                         both_trees ? kFirstSkillTree : target_tree,
+                         kSecondSkillTree,
+                         both_trees,
+                         changer_target,
+                         status_for_log)) {
+        return false;
+    }
+
+    CPremiumLetheManager* const lethe =
+        G_CGameManager()->GetPremiumLetheManager();
+    UpdateLetheState(user, lethe, both_trees, target_tree);
+    return true;
+}
+
+void ResetPvpSkills(CUser* user, bool both_trees) {
+    SkillSlot* const skill_slot = user->getCurCharacSkillW();
+    const ENUM_SKILL_TREE_KIND current_tree = static_cast<ENUM_SKILL_TREE_KIND>(
+        user->GetCurCharacSkillTreeIndex());
+    const ENUM_SKILL_TREE_KIND target_tree =
+        current_tree == ENUM_SKILL_TREE_CURRENT || current_tree == kFirstSkillTree
+            ? kFirstSkillTree
+            : kSecondSkillTree;
+    if (both_trees) {
+        skill_slot->clear_all_skills_both();
+        skill_slot->set_parent(user);
+        user->givePvPSkillTree(0, true, 3);
+    } else {
+        skill_slot->clear_all_skills(target_tree);
+        skill_slot->set_parent(user);
+        user->givePvPSkillTree(0,
+                               true,
+                               target_tree == kFirstSkillTree ? 1 : 2);
+    }
+
+    const int pvp_skill_point =
+        G_CDataManager()->get_pvp_skill_tree_parameter_script()
+            ->getPvPSkillPoint(user->get_charac_job(),
+                               user->getCurCharFirstGrowType(),
+                               user->getCurCharSecondGrowType(),
+                               user->get_pvp_grade(),
+                               false);
+    if (both_trees) {
+        skill_slot->set_remain_sp_at_index(pvp_skill_point, kFirstSkillTree);
+        skill_slot->set_remain_sp_at_index(pvp_skill_point, kSecondSkillTree);
+    } else {
+        skill_slot->set_remain_sp_at_index(pvp_skill_point, target_tree);
+    }
+    user->send_skill_info();
+    UpdateLetheState(user,
+                     G_CGameManager()->GetPremiumLetheManager(),
+                     both_trees,
+                     target_tree);
+}
+
+void SendUseStatusError(CUser* user,
+                        PacketGuard& packet,
+                        unsigned char error) {
+    user->SendCmdErrorPacket(kUseStatusCommand, error, packet);
+}
+
+}  // namespace
+
+// IDA_EA: 0x86657FC
+// IDA_NAME: _ZN5CUser15increase_statusEs
+// DEMANGLED: CUser::increase_status(short)
+void CUser::increase_status(short slot) {
+    PacketGuard packet;
+    if (CheckInTrade()) {
+        SendUseStatusError(this, packet, 19);
+        return;
+    }
+
+    const Inven_Item used_item = getCurCharacInvenR()->GetInvenSlot(1, slot);
+    const int item_id = used_item.getKey();
+    int status = -1;
+    int value = 0;
+    bool check_skill_item = false;
+    bool pvp_skill_item = false;
+    bool pvp_both_trees = false;
+
+    switch (item_id) {
+    case 3: case 28: case 109: case 161: case 162:
+    case 916: case 960: case 963: case 1206: case 1253:
+        check_skill_item = true;
+        break;
+    case 42:
+        status = 21;
+        value = 1;
+        break;
+    case 201:
+    case 2670008: {
+        CEventBase* const event =
+            GlobalData::s_event_manager->GetRepeatEvent(15);
+        if (event && event->IsEventing(0)) {
+            SendUseStatusError(this, packet, 19);
+            return;
+        }
+        if (!getCurCharacTotalFatigue()) {
+            SendUseStatusError(this, packet, 67);
+            return;
+        }
+        status = 14;
+        break;
+    }
+    case 1031: status = 0; value = 5; break;
+    case 1034: status = 1; value = 100; break;
+    case 1035: status = 1; value = 1000; break;
+    case 1036: status = 1; value = 10000; break;
+    case 1037: status = 1; value = 100000; break;
+    case 1038: status = 0; value = 20; break;
+    case 1039: status = 4; value = 50; break;
+    case 1040: case 1042: status = 6; value = 50; break;
+    case 1041: status = 5; value = 50; break;
+    case 1043: status = 2; value = 250; break;
+    case 1044: status = 3; value = 250; break;
+    case 1045: status = 8; value = 10; break;
+    case 1046: status = 9; value = 10; break;
+    case 1200: case 1201: case 1202: {
+        GuildParameterScript* const guild_parameter =
+            G_CDataManager()->GetGuildParameterScriptForBuild();
+        STGuildLevelUpParam* const level_param =
+            guild_parameter->getGuildLevelUpParam(GetGuildLevel() + 1);
+        STGuildDBInfoOnly* const guild_info = GetGuildDBInfo();
+        if (!level_param || guild_info->guild_experience >=
+                                 static_cast<uint32_t>(level_param->value_04)) {
+            SendUseStatusError(this, packet, 210);
+            return;
+        }
+        status = 16;
+        value = guild_parameter->getGuildExpBook(static_cast<char>(item_id));
+        break;
+    }
+    case 1204: status = 17; value = 1; break;
+    case 1205: status = 17; value = 5; break;
+    case 1231: status = 1; value = 1000000; break;
+    case 1232: status = 1; value = 10000000; break;
+    case 1247: status = 19; value = 10; break;
+    case 3204:
+        if (!get_charac_guildkey()) {
+            SendUseStatusError(this, packet, 64);
+            return;
+        }
+        status = 11;
+        value = 10;
+        break;
+    case 7101:
+        if (get_state() != 3) {
+            SendUseStatusError(this, packet, 19);
+            return;
+        }
+        status = 13;
+        value = 8;
+        break;
+    case 7105:
+        if (!get_charac_guildkey()) {
+            SendUseStatusError(this, packet, 64);
+            return;
+        }
+        status = 11;
+        value = 50;
+        break;
+    case 7180: status = 13; value = 1; break;
+    case 7181: status = 13; value = 5; break;
+    case 7298:
+        if (get_state() != 3) {
+            SendUseStatusError(this, packet, 19);
+            return;
+        }
+        status = 13;
+        value = 2;
+        break;
+    case 7958: status = 20; break;
+    case 8049:
+    case 8270:
+    case 8271:
+    case 2675388: {
+        char level_up_item_state = static_cast<char>(status);
+        if (CalLevelUpItemCheck(static_cast<unsigned long>(item_id)) &&
+            !CalLevelUpItemState(level_up_item_state,
+                                 value,
+                                 19,
+                                 59)) {
+            SendUseStatusError(this, packet, 19);
+            return;
+        }
+        status = level_up_item_state;
+        break;
+    }
+    case 690000097:
+    case 10000915: {
+        char level_up_item_state = static_cast<char>(status);
+        if (!CalLevelUpItemState(
+                level_up_item_state,
+                value,
+                oldsrv::config::kCharacterLevelMinimum,
+                oldsrv::config::kCharacterLevelBeforeMaximum)) {
+            SendUseStatusError(this, packet, 19);
+            return;
+        }
+        status = level_up_item_state;
+        break;
+    }
+    case 2660171:
+    case 2660232:
+        pvp_skill_item = true;
+        pvp_both_trees = item_id == 2660232;
+        break;
+    case 2660172: {
+        if (!G_GameWorld()->IsPvPSkilTreeChannel()) {
+            SendUseStatusError(this, packet, 23);
+            return;
+        }
+        const int security_error = GlobalData::s_pSecuProtectionField->Check(
+            this, static_cast<SECURITY_PROTCTION>(44));
+        if (security_error) {
+            SendUseStatusError(this, packet,
+                               static_cast<unsigned char>(security_error));
+            return;
+        }
+        if (!isAffectedPremium(kOneDayLethePremium)) {
+            SendUseStatusError(this, packet, 216);
+            return;
+        }
+        status = 23;
+        break;
+    }
+    case 2660396:
+        check_skill_item = true;
+        break;
+    case 2675021: status = 21; value = 1; break;
+    case 690000220: {
+        if (!IsGuildMaster()) {
+            SendUseStatusError(this, packet, 219);
+            return;
+        }
+        GuildParameterScript* const guild_parameter =
+            G_CDataManager()->GetGuildParameterScriptForBuild();
+        STGuildLevelUpParam* const level_param =
+            guild_parameter->getGuildLevelUpParam(GetGuildLevel() + 1);
+        STGuildDBInfoOnly* const guild_info = GetGuildDBInfo();
+        if (!level_param || guild_info->guild_experience >=
+                                 static_cast<uint32_t>(level_param->value_04)) {
+            SendUseStatusError(this, packet, 210);
+            return;
+        }
+        status = 16;
+        value = guild_parameter->getGuildExpBook(static_cast<char>(item_id));
+        break;
+    }
+    case 690000301: status = 25; value = 1; break;
+    default: {
+        CItem* const item = G_CDataManager()->find_item(item_id);
+        if (item_id == G_CDataManager()->GetSpecialLevelExpItemId()) {
+            if (!item || !item->is_stackable() ||
+                get_charac_level() < item->getUsableLevel() ||
+                get_charac_level() > 71 ||
+                item->GetIncreaseStatusIntData(0, value) != 1) {
+                SendUseStatusError(this, packet, 17);
+                return;
+            }
+            status = 1;
+        } else if (item && item->GetIncreaseStatusType() == 1) {
+            item->GetIncreaseStatusIntData(0, value);
+            status = 1;
+        }
+        break;
+    }
+    }
+
+    if (check_skill_item) {
+        const int security_error = GlobalData::s_pSecuProtectionField->Check(
+            this, static_cast<SECURITY_PROTCTION>(44));
+        if (security_error) {
+            SendUseStatusError(this, packet,
+                               static_cast<unsigned char>(security_error));
+            return;
+        }
+        if (G_GameWorld()->IsPvPSkilTreeChannel()) {
+            SendUseStatusError(this, packet, 23);
+            return;
+        }
+        if (CheckItemLock(1, slot)) {
+            SendUseStatusError(this, packet, 213);
+            return;
+        }
+        if (!WongWork::CSkillChanger::CheckCondition(this)) {
+            setCurCharacExp(G_CDataManager()->get_level_exp(get_charac_level()));
+        }
+        if (item_id == 1206 || item_id == 1253) {
+            if (get_charac_level() <= 49) {
+                return;
+            }
+            if (isAffectedPremium(kOneDayLethePremium)) {
+                SendUseStatusError(this, packet, 216);
+                return;
+            }
+            status = 18;
+            value = 1;
+        } else if (item_id == 916) {
+            status = 10;
+            value = 1;
+        } else if (item_id == 960) {
+            status = 24;
+            value = 1;
+            CQuestShop* const quest_shop = static_cast<CQuestShop*>(
+                GetCharacExpandData(static_cast<ENUM_CHARAC_EXPAND_TYPE>(11)));
+            if (quest_shop) {
+                quest_shop->clearQP(this);
+                quest_shop->sendCharacQp(this, 0);
+            }
+        } else {
+            status = 10;
+            value = item_id == 963 || item_id == 2660396;
+        }
+    }
+
+    if (pvp_skill_item) {
+        if (!G_GameWorld()->IsPvPSkilTreeChannel()) {
+            SendUseStatusError(this, packet, 23);
+            return;
+        }
+        const int security_error = GlobalData::s_pSecuProtectionField->Check(
+            this, static_cast<SECURITY_PROTCTION>(44));
+        if (security_error) {
+            SendUseStatusError(this, packet,
+                               static_cast<unsigned char>(security_error));
+            return;
+        }
+        if (!WongWork::CSkillChanger::CheckCondition(this)) {
+            SendUseStatusError(this, packet, 1);
+            return;
+        }
+        status = 22;
+        value = pvp_both_trees;
+    }
+
+    if (status == -1) {
+        SendUseStatusError(this, packet, 17);
+        return;
+    }
+    if (status == 15) {
+        if (get_state() != 3 || getCurCharacFatigue() < value) {
+            SendUseStatusError(this, packet, get_state() == 3 ? 95 : 19);
+            return;
+        }
+    }
+    if ((status == 0 || status == 1 || status == 17) &&
+        G_GameWorld()->IsPvPSkilTreeChannel()) {
+        SendUseStatusError(this, packet, 19);
+        return;
+    }
+
+    CItem* const item = G_CDataManager()->find_item(item_id);
+    if (!item) {
+        return;
+    }
+    if (item->GetUsablePvPRank() > get_pvp_grade()) {
+        SendUseStatusError(this, packet, 1);
+        return;
+    }
+    if (item->vtable_->get_item_type(item) != 21 &&
+        getCurCharacInvenW()->delete_item(static_cast<INVEN_TYPE>(1),
+                                          slot,
+                                          1,
+                                          static_cast<eItemDelReason>(10),
+                                          true) != 1) {
+        SendUseStatusError(this, packet, 17);
+        return;
+    }
+
+    switch (status) {
+    case 0:
+        gain_sp(value);
+        history_log_sp(-1, value, static_cast<eSPAddReason>(1));
+        SendStatusPacket(this, packet, slot, status, value);
+        return;
+    case 1: {
+        int gained_sp = 0;
+        int gained_sfp = 0;
+        int previous_level = 0;
+        int current_level = 0;
+        if (get_charac_level() >=
+            oldsrv::config::kCharacterLevelMaximum) {
+            value = 0;
+        }
+        rewardExp(value,
+                  gained_sp,
+                  gained_sfp,
+                  previous_level,
+                  current_level,
+                  item_id == G_CDataManager()->GetSpecialLevelExpItemId()
+                      ? static_cast<eExpAddReason>(3)
+                      : static_cast<eExpAddReason>(0),
+                  true);
+        SendStatusPacket(this,
+                         packet,
+                         slot,
+                         status,
+                         value,
+                         static_cast<short>(current_level - previous_level),
+                         static_cast<short>(gained_sfp));
+        return;
+    }
+    case 2: getCurCharacAddInfoRefW()->max_hp += value; break;
+    case 3: getCurCharacAddInfoRefW()->max_mp += value; break;
+    case 4: getCurCharacAddInfoRefW()->physical_attack += value; break;
+    case 5: getCurCharacAddInfoRefW()->physical_defense += value; break;
+    case 6: getCurCharacAddInfoRefW()->magical_attack += value; break;
+    case 7: getCurCharacAddInfoRefW()->magical_defense += value; break;
+    case 8: getCurCharacAddInfoRefW()->character_weight += value; break;
+    case 9:
+        for (int index = 0; index < 4; ++index) {
+            getCurCharacAddInfoRefW()->element_resist[index] += value;
+        }
+        break;
+    case 10:
+    case 24:
+        if (!ResetNormalSkills(this, value == 1, status)) {
+            return;
+        }
+        break;
+    case 11:
+        if (get_charac_guildkey()) {
+            add_guild_exp(value);
+        }
+        break;
+    case 12: setCurCharacStamina(static_cast<unsigned char>(value)); break;
+    case 13: {
+        const int event_coin = getCurCharacInvenR()->GetEventCoin() + value;
+        getCurCharacInvenW()->SetEventCoin(event_coin);
+        history_log().EventCoinAdd(getCurCharacInvenR()->GetEventCoin(),
+                                   value,
+                                   static_cast<eCoinAddReason>(2));
+        SendUpdateItemList(static_cast<eSendTarget>(1),
+                           static_cast<ENUM_ITEMSPACE>(0),
+                           1);
+        break;
+    }
+    case 14:
+        RecoverFatigue(value);
+        SendFatigue();
+        break;
+    case 15:
+        setCurCharacFatigue(
+            getCurCharacFatigue() - value > 0 ? getCurCharacFatigue() - value : 0);
+        SendFatigue();
+        break;
+    case 16:
+        if (get_charac_guildkey()) {
+            GlobalData::s_guild_proxy_mgr
+                ->GetServerProxy(static_cast<ENUM_SERVER_GROUP>(GetServerGroup()))
+                ->SendIncreaseGuildExp(static_cast<unsigned int>(get_charac_guildkey()),
+                                       static_cast<unsigned int>(get_charac_no(-1)),
+                                       static_cast<unsigned int>(value),
+                                       1);
+        }
+        break;
+    case 17:
+        gain_sfp(value);
+        history_log_sfp(-1, value, static_cast<eSPAddReason>(1));
+        SendStatusPacket(this, packet, slot, status, value);
+        return;
+    case 18: {
+        const ENUM_SKILL_TREE_KIND current_tree =
+            static_cast<ENUM_SKILL_TREE_KIND>(GetCurCharacSkillTreeIndex());
+        const ENUM_SKILL_TREE_KIND tree =
+            current_tree == ENUM_SKILL_TREE_CURRENT || current_tree == kFirstSkillTree
+                ? kFirstSkillTree
+                : kSecondSkillTree;
+        getCurCharacSkillW()->clear_sfp_skills(get_charac_job(), tree);
+        getCurCharacSkillW()->set_parent(this);
+        WongWork::CSkillChanger skill_changer;
+        skill_changer.SkillInitialize(this, tree == kFirstSkillTree ? 3 : 4, false);
+        send_skill_info();
+        break;
+    }
+    case 19: IncreasePowerWarPoint(static_cast<int16_t>(value)); break;
+    case 20:
+        adjust_charac_stat();
+        if (get_state() == 3) {
+            SendBasicInfo(this, packet);
+            Send(packet);
+        }
+        break;
+    case 21: {
+        const int coin = getCurCharacInvenR()->GetCoin() + value;
+        getCurCharacInvenW()->SetCoin(coin);
+        history_log().CoinAdd(getCurCharacInvenR()->GetCoin(),
+                              value,
+                              static_cast<eCoinAddReason>(3));
+        SendUpdateItemList(static_cast<eSendTarget>(1),
+                           static_cast<ENUM_ITEMSPACE>(0),
+                           1);
+        break;
+    }
+    case 22: ResetPvpSkills(this, value == 1); break;
+    case 23: {
+        CPremiumLetheManager* const lethe =
+            G_CGameManager()->GetPremiumLetheManager();
+        const int skill_tree = GetCurCharacSkillTreeIndex();
+        const int charac_no = getCurCharacNo();
+        const char* const charac_name = getCurCharacName();
+        cMyTrace trace("void CUser::increase_status(short int)", 19466, 0);
+        trace("ONE_DAY_LETHE : BUY_SKILL_CONFIRM_TICKET, char(%s), char_no(%d), style(%d)",
+              charac_name,
+              charac_no,
+              skill_tree);
+        if (lethe) {
+            lethe->ConfirmSkillReq(this);
+        }
+        break;
+    }
+    case 25:
+        getCurCharacInvenW()->avatar_coin_.Add(static_cast<unsigned int>(value));
+        AvatarCoin::SaveToDB(this);
+        AvatarCoin::SendSyncPacket(this);
+        AvatarCoin::HistoryLog::AddLog(this, static_cast<unsigned int>(value));
+        break;
+    default:
+        break;
+    }
+
+    SendCompletionAndBroadcast(this, packet, slot, status, value);
+}

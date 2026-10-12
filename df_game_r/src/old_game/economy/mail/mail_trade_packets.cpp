@@ -1,0 +1,332 @@
+#include "old_game/economy/mail/mail_trade_packets.h"
+
+#include <cstring>
+#include <new>
+
+#include "old_game/economy/mall/auction_public_values.h"
+
+
+typedef char Packet_Monitor_Notify_New_Mail_Size_Must_Be_0x12[
+    (sizeof(Packet_Monitor_Notify_New_Mail) == 0x12) ? 1 : -1];
+typedef char Packet_Monitor_Send_Guild_Mail_Size_Must_Be_0x112[
+    (sizeof(Packet_Monitor_Send_Guild_Mail) == 0x112) ? 1 : -1];
+typedef char PCK_AUCTION_CHECK_AUCTION_READY_GA_Size_Must_Be_0x12[
+    (sizeof(PCK_AUCTION_CHECK_AUCTION_READY_GA) == 0x12) ? 1 : -1];
+typedef char PCK_AUCTION_CHECK_AUCTION_READY_GP_Size_Must_Be_0x12[
+    (sizeof(PCK_AUCTION_CHECK_AUCTION_READY_GP) == 0x12) ? 1 : -1];
+typedef char PCK_AUCTION_REGIST_GA_Size_Must_Be_0x16[
+    (sizeof(PCK_AUCTION_REGIST_GA) == 0x16) ? 1 : -1];
+typedef char PCK_AUCTION_REGIST_GP_Size_Must_Be_0x16[
+    (sizeof(PCK_AUCTION_REGIST_GP) == 0x16) ? 1 : -1];
+typedef char PCK_AUCTION_BIDDING_GA_Size_Must_Be_0x33[
+    (sizeof(PCK_AUCTION_BIDDING_GA) == 0x33) ? 1 : -1];
+typedef char PCK_AUCTION_BIDDING_GP_Size_Must_Be_0x33[
+    (sizeof(PCK_AUCTION_BIDDING_GP) == 0x33) ? 1 : -1];
+typedef char PCK_AUCTION_REGIST_CANCEL_GA_Size_Must_Be_0x22[
+    (sizeof(PCK_AUCTION_REGIST_CANCEL_GA) == 0x22) ? 1 : -1];
+typedef char PCK_AUCTION_REGIST_CANCEL_GP_Size_Must_Be_0x22[
+    (sizeof(PCK_AUCTION_REGIST_CANCEL_GP) == 0x22) ? 1 : -1];
+typedef char PCK_AUCTION_ASK_AVERAGE_PRICE_GP_Size_Must_Be_0x1f[
+    (sizeof(PCK_AUCTION_ASK_AVERAGE_PRICE_GP) == 0x1f) ? 1 : -1];
+typedef char PCK_AUCTION_ASK_AVERAGE_PRICE_GA_Size_Must_Be_0x2f[
+    (sizeof(PCK_AUCTION_ASK_AVERAGE_PRICE_GA) == 0x2f) ? 1 : -1];
+typedef char PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GP_Size_Must_Be_0x2d[
+    (sizeof(PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GP) == 0x2d) ? 1 : -1];
+typedef char PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GA_Size_Must_Be_0x3d[
+    (sizeof(PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GA) == 0x3d) ? 1 : -1];
+typedef char PCK_AUCTION_REGIST_ITEM_GA_Size_Must_Be_0xc5[
+    (sizeof(PCK_AUCTION_REGIST_ITEM_GA) == 0xc5) ? 1 : -1];
+typedef char PCK_AUCTION_SEARCH_BY_ITEMKEY_GA_Size_Must_Be_0x81[
+    (sizeof(PCK_AUCTION_SEARCH_BY_ITEMKEY_GA) == 0x81) ? 1 : -1];
+typedef char PCK_AUCTION_SEARCH_BY_ITEMKEY_GP_Size_Must_Be_0x81[
+    (sizeof(PCK_AUCTION_SEARCH_BY_ITEMKEY_GP) == 0x81) ? 1 : -1];
+typedef char PCK_AUCTION_SEARCH_BY_NOITEMKEY_GA_Size_Must_Be_0x33[
+    (sizeof(PCK_AUCTION_SEARCH_BY_NOITEMKEY_GA) == 0x33) ? 1 : -1];
+typedef char PCK_AUCTION_SEARCH_BY_NOITEMKEY_GP_Size_Must_Be_0x33[
+    (sizeof(PCK_AUCTION_SEARCH_BY_NOITEMKEY_GP) == 0x33) ? 1 : -1];
+typedef char PCK_AUCTION_MY_REGISTED_ITEM_INFO_GA_Size_Must_Be_0x1a[
+    (sizeof(PCK_AUCTION_MY_REGISTED_ITEM_INFO_GA) == 0x1a) ? 1 : -1];
+typedef char PCK_AUCTION_MY_REGISTED_ITEM_INFO_GP_Size_Must_Be_0x1a[
+    (sizeof(PCK_AUCTION_MY_REGISTED_ITEM_INFO_GP) == 0x1a) ? 1 : -1];
+typedef char PCK_AUCTION_MY_BIDDING_INFO_GA_Size_Must_Be_0x1a[
+    (sizeof(PCK_AUCTION_MY_BIDDING_INFO_GA) == 0x1a) ? 1 : -1];
+typedef char PCK_AUCTION_MY_AUCTION_HISTORY_GA_Size_Must_Be_0x1e[
+    (sizeof(PCK_AUCTION_MY_AUCTION_HISTORY_GA) == 0x1e) ? 1 : -1];
+typedef char PCK_AUCTION_ASK_OWNER_IS_VIP_GP_Size_Must_Be_0x37[
+    (sizeof(PCK_AUCTION_ASK_OWNER_IS_VIP_GP) == 0x37) ? 1 : -1];
+typedef char PCK_AUCTION_OPEN_PRIVATE_STORE_GA_Size_Must_Be_0xaa[
+    (sizeof(PCK_AUCTION_OPEN_PRIVATE_STORE_GA) == 0xaa) ? 1 : -1];
+typedef char PCK_AUCTION_CLOSE_PRIVATE_STORE_GA_Size_Must_Be_0x16[
+    (sizeof(PCK_AUCTION_CLOSE_PRIVATE_STORE_GA) == 0x16) ? 1 : -1];
+typedef char PCK_AUCTION_BUY_ITEM_APIECE_GA_Size_Must_Be_0x2a[
+    (sizeof(PCK_AUCTION_BUY_ITEM_APIECE_GA) == 0x2a) ? 1 : -1];
+
+// IDA_EA: 0x847164C
+// IDA_NAME: _ZN30Packet_Monitor_Notify_New_MailC2Ev
+// DEMANGLED: Packet_Monitor_Notify_New_Mail::Packet_Monitor_Notify_New_Mail(void)
+Packet_Monitor_Notify_New_Mail::Packet_Monitor_Notify_New_Mail()
+    : PacketHeader(0x0514u, 0x0012u) {}
+
+// IDA_EA: 0x846F87E
+// IDA_NAME: _ZN30Packet_Monitor_Send_Guild_MailC2Ev
+// DEMANGLED: Packet_Monitor_Send_Guild_Mail::Packet_Monitor_Send_Guild_Mail(void)
+Packet_Monitor_Send_Guild_Mail::Packet_Monitor_Send_Guild_Mail()
+    : PacketHeader(0x0432u, 0x0112u) {
+    std::memset(body_12, 0, sizeof(body_12));
+}
+
+// IDA_EA: 0x82F7D9E
+// IDA_NAME: _ZN34PCK_AUCTION_CHECK_AUCTION_READY_GAC2Ev
+// DEMANGLED: PCK_AUCTION_CHECK_AUCTION_READY_GA::PCK_AUCTION_CHECK_AUCTION_READY_GA(void)
+PCK_AUCTION_CHECK_AUCTION_READY_GA::PCK_AUCTION_CHECK_AUCTION_READY_GA() {
+    std::memset(this, 0, 0x12u);
+    setCategory(0);
+    setPacketID(13);
+    setSize(18);
+}
+
+// IDA_EA: 0x82F7E6E
+// IDA_NAME: _ZN34PCK_AUCTION_CHECK_AUCTION_READY_GPC2Ev
+// DEMANGLED: PCK_AUCTION_CHECK_AUCTION_READY_GP::PCK_AUCTION_CHECK_AUCTION_READY_GP(void)
+PCK_AUCTION_CHECK_AUCTION_READY_GP::PCK_AUCTION_CHECK_AUCTION_READY_GP() {
+    std::memset(this, 0, 0x12u);
+    setCategory(18);
+    setPacketID(13);
+    setSize(18);
+}
+
+// IDA_EA: 0x82F7D36
+// IDA_NAME: _ZN21PCK_AUCTION_REGIST_GAC2Ev
+// DEMANGLED: PCK_AUCTION_REGIST_GA::PCK_AUCTION_REGIST_GA(void)
+PCK_AUCTION_REGIST_GA::PCK_AUCTION_REGIST_GA() {
+    std::memset(this, 0, 0x16u);
+    setCategory(0);
+    setPacketID(0);
+    setSize(22);
+}
+
+// IDA_EA: 0x82F7E06
+// IDA_NAME: _ZN21PCK_AUCTION_REGIST_GPC2Ev
+// DEMANGLED: PCK_AUCTION_REGIST_GP::PCK_AUCTION_REGIST_GP(void)
+PCK_AUCTION_REGIST_GP::PCK_AUCTION_REGIST_GP() {
+    std::memset(this, 0, 0x16u);
+    setCategory(18);
+    setPacketID(0);
+    setSize(22);
+}
+
+// IDA_EA: 0x822E62C
+// IDA_NAME: _ZN22PCK_AUCTION_BIDDING_GAC2Ev
+// DEMANGLED: PCK_AUCTION_BIDDING_GA::PCK_AUCTION_BIDDING_GA(void)
+PCK_AUCTION_BIDDING_GA::PCK_AUCTION_BIDDING_GA() {
+    std::memset(this, 0, 0x33u);
+    setCategory(0);
+    setPacketID(5);
+    setSize(51);
+}
+
+// IDA_EA: 0x84E9A98
+// IDA_NAME: _ZN22PCK_AUCTION_BIDDING_GPC2Ev
+// DEMANGLED: PCK_AUCTION_BIDDING_GP::PCK_AUCTION_BIDDING_GP(void)
+PCK_AUCTION_BIDDING_GP::PCK_AUCTION_BIDDING_GP() {
+    std::memset(this, 0, 0x33u);
+    setCategory(18);
+    setPacketID(5);
+    setSize(51);
+}
+
+// IDA_EA: 0x822E5C4
+// IDA_NAME: _ZN28PCK_AUCTION_REGIST_CANCEL_GAC2Ev
+// DEMANGLED: PCK_AUCTION_REGIST_CANCEL_GA::PCK_AUCTION_REGIST_CANCEL_GA(void)
+PCK_AUCTION_REGIST_CANCEL_GA::PCK_AUCTION_REGIST_CANCEL_GA() {
+    std::memset(this, 0, 0x22u);
+    setCategory(0);
+    setPacketID(4);
+    setSize(34);
+}
+
+// IDA_EA: 0x822EA1C
+// IDA_NAME: _ZN28PCK_AUCTION_REGIST_CANCEL_GPC2Ev
+// DEMANGLED: PCK_AUCTION_REGIST_CANCEL_GP::PCK_AUCTION_REGIST_CANCEL_GP(void)
+PCK_AUCTION_REGIST_CANCEL_GP::PCK_AUCTION_REGIST_CANCEL_GP() {
+    std::memset(this, 0, 0x22u);
+    setCategory(18);
+    setPacketID(4);
+    setSize(34);
+}
+
+// IDA_EA: 0x822E94C
+// IDA_NAME: _ZN32PCK_AUCTION_ASK_AVERAGE_PRICE_GPC2Ev
+// DEMANGLED: PCK_AUCTION_ASK_AVERAGE_PRICE_GP::PCK_AUCTION_ASK_AVERAGE_PRICE_GP(void)
+PCK_AUCTION_ASK_AVERAGE_PRICE_GP::PCK_AUCTION_ASK_AVERAGE_PRICE_GP() {
+    std::memset(this, 0, 0x1fu);
+    setCategory(18);
+    setPacketID(1);
+    setSize(31);
+}
+
+// IDA_EA: 0x822E4D8
+// IDA_NAME: _ZN32PCK_AUCTION_ASK_AVERAGE_PRICE_GAC2Ev
+// DEMANGLED: PCK_AUCTION_ASK_AVERAGE_PRICE_GA::PCK_AUCTION_ASK_AVERAGE_PRICE_GA(void)
+PCK_AUCTION_ASK_AVERAGE_PRICE_GA::PCK_AUCTION_ASK_AVERAGE_PRICE_GA() {
+    std::memset(this, 0, 0x2fu);
+    setCategory(0);
+    setPacketID(1);
+    setSize(47);
+}
+
+// IDA_EA: 0x822E9B4
+// IDA_NAME: _ZN36PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GPC2Ev
+// DEMANGLED: PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GP::PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GP(void)
+PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GP::
+    PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GP() {
+    std::memset(this, 0, 0x2du);
+    setCategory(18);
+    setPacketID(2);
+    setSize(45);
+}
+
+// IDA_EA: 0x822E54E
+// IDA_NAME: _ZN36PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GAC2Ev
+// DEMANGLED: PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GA::PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GA(void)
+PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GA::
+    PCK_AUCTION_ASK_REGISTED_ITEM_NUM_GA() {
+    std::memset(this, 0, 0x3du);
+    setCategory(0);
+    setPacketID(2);
+    setSize(61);
+}
+
+// IDA_EA: 0x84E9A12
+// IDA_NAME: _ZN26PCK_AUCTION_REGIST_ITEM_GAC2Ev
+// DEMANGLED: PCK_AUCTION_REGIST_ITEM_GA::PCK_AUCTION_REGIST_ITEM_GA(void)
+PCK_AUCTION_REGIST_ITEM_GA::PCK_AUCTION_REGIST_ITEM_GA() {
+    std::memset(this, 0, 0xc5u);
+    setCategory(0);
+    setPacketID(3);
+    setSize(197);
+}
+
+// IDA_EA: 0x822E6AA
+// IDA_NAME: _ZN32PCK_AUCTION_SEARCH_BY_ITEMKEY_GAC2Ev
+// DEMANGLED: PCK_AUCTION_SEARCH_BY_ITEMKEY_GA::PCK_AUCTION_SEARCH_BY_ITEMKEY_GA(void)
+PCK_AUCTION_SEARCH_BY_ITEMKEY_GA::PCK_AUCTION_SEARCH_BY_ITEMKEY_GA() {
+    std::memset(this, 0, 0x81u);
+    setCategory(0);
+    setPacketID(6);
+    setSize(129);
+}
+
+// IDA_EA: 0x822EA84
+// IDA_NAME: _ZN32PCK_AUCTION_SEARCH_BY_ITEMKEY_GPC2Ev
+// DEMANGLED: PCK_AUCTION_SEARCH_BY_ITEMKEY_GP::PCK_AUCTION_SEARCH_BY_ITEMKEY_GP(void)
+PCK_AUCTION_SEARCH_BY_ITEMKEY_GP::PCK_AUCTION_SEARCH_BY_ITEMKEY_GP() {
+    std::memset(this, 0, 0x81u);
+    setCategory(18);
+    setPacketID(6);
+    setSize(129);
+}
+
+// IDA_EA: 0x822E736
+// IDA_NAME: _ZN34PCK_AUCTION_SEARCH_BY_NOITEMKEY_GAC2Ev
+// DEMANGLED: PCK_AUCTION_SEARCH_BY_NOITEMKEY_GA::PCK_AUCTION_SEARCH_BY_NOITEMKEY_GA(void)
+PCK_AUCTION_SEARCH_BY_NOITEMKEY_GA::
+    PCK_AUCTION_SEARCH_BY_NOITEMKEY_GA() {
+    std::memset(this, 0, 0x33u);
+    setCategory(0);
+    setPacketID(7);
+    setSize(51);
+}
+
+// IDA_EA: 0x822EAFA
+// IDA_NAME: _ZN34PCK_AUCTION_SEARCH_BY_NOITEMKEY_GPC2Ev
+// DEMANGLED: PCK_AUCTION_SEARCH_BY_NOITEMKEY_GP::PCK_AUCTION_SEARCH_BY_NOITEMKEY_GP(void)
+PCK_AUCTION_SEARCH_BY_NOITEMKEY_GP::
+    PCK_AUCTION_SEARCH_BY_NOITEMKEY_GP() {
+    std::memset(this, 0, 0x33u);
+    setCategory(18);
+    setPacketID(7);
+    setSize(51);
+}
+
+// IDA_EA: 0x822E7AC
+// IDA_NAME: _ZN36PCK_AUCTION_MY_REGISTED_ITEM_INFO_GAC2Ev
+// DEMANGLED: PCK_AUCTION_MY_REGISTED_ITEM_INFO_GA::PCK_AUCTION_MY_REGISTED_ITEM_INFO_GA(void)
+PCK_AUCTION_MY_REGISTED_ITEM_INFO_GA::
+    PCK_AUCTION_MY_REGISTED_ITEM_INFO_GA() {
+    std::memset(this, 0, 0x1au);
+    setCategory(0);
+    setPacketID(8);
+    setSize(26);
+}
+
+// IDA_EA: 0x822EB70
+// IDA_NAME: _ZN36PCK_AUCTION_MY_REGISTED_ITEM_INFO_GPC2Ev
+// DEMANGLED: PCK_AUCTION_MY_REGISTED_ITEM_INFO_GP::PCK_AUCTION_MY_REGISTED_ITEM_INFO_GP(void)
+PCK_AUCTION_MY_REGISTED_ITEM_INFO_GP::
+    PCK_AUCTION_MY_REGISTED_ITEM_INFO_GP() {
+    std::memset(this, 0, 0x1au);
+    setCategory(18);
+    setPacketID(8);
+    setSize(26);
+}
+
+// IDA_EA: 0x822E814
+// IDA_NAME: _ZN30PCK_AUCTION_MY_BIDDING_INFO_GAC2Ev
+// DEMANGLED: PCK_AUCTION_MY_BIDDING_INFO_GA::PCK_AUCTION_MY_BIDDING_INFO_GA(void)
+PCK_AUCTION_MY_BIDDING_INFO_GA::PCK_AUCTION_MY_BIDDING_INFO_GA() {
+    std::memset(this, 0, 0x1au);
+    setCategory(0);
+    setPacketID(9);
+    setSize(26);
+}
+
+// IDA_EA: 0x822E87C
+// IDA_NAME: _ZN33PCK_AUCTION_MY_AUCTION_HISTORY_GAC2Ev
+// DEMANGLED: PCK_AUCTION_MY_AUCTION_HISTORY_GA::PCK_AUCTION_MY_AUCTION_HISTORY_GA(void)
+PCK_AUCTION_MY_AUCTION_HISTORY_GA::PCK_AUCTION_MY_AUCTION_HISTORY_GA() {
+    std::memset(this, 0, 0x1eu);
+    setCategory(0);
+    setPacketID(10);
+    setSize(30);
+}
+
+// IDA_EA: 0x822EBD8
+// IDA_NAME: _ZN31PCK_AUCTION_ASK_OWNER_IS_VIP_GPC2Ev
+// DEMANGLED: PCK_AUCTION_ASK_OWNER_IS_VIP_GP::PCK_AUCTION_ASK_OWNER_IS_VIP_GP(void)
+PCK_AUCTION_ASK_OWNER_IS_VIP_GP::PCK_AUCTION_ASK_OWNER_IS_VIP_GP() {
+    std::memset(this, 0, 0x37u);
+    setCategory(18);
+    setPacketID(14);
+    setSize(55);
+}
+
+// IDA_EA: 0x85CB374
+// IDA_NAME: _ZN33PCK_AUCTION_OPEN_PRIVATE_STORE_GAC2Ev
+// DEMANGLED: PCK_AUCTION_OPEN_PRIVATE_STORE_GA::PCK_AUCTION_OPEN_PRIVATE_STORE_GA(void)
+PCK_AUCTION_OPEN_PRIVATE_STORE_GA::PCK_AUCTION_OPEN_PRIVATE_STORE_GA() {
+    std::memset(this, 0, 0xaau);
+    setCategory(0);
+    setPacketID(11);
+    setSize(170);
+}
+
+// IDA_EA: 0x85CB3DC
+// IDA_NAME: _ZN34PCK_AUCTION_CLOSE_PRIVATE_STORE_GAC2Ev
+// DEMANGLED: PCK_AUCTION_CLOSE_PRIVATE_STORE_GA::PCK_AUCTION_CLOSE_PRIVATE_STORE_GA(void)
+PCK_AUCTION_CLOSE_PRIVATE_STORE_GA::PCK_AUCTION_CLOSE_PRIVATE_STORE_GA() {
+    std::memset(this, 0, 0x16u);
+    setCategory(0);
+    setPacketID(12);
+    setSize(22);
+}
+
+// IDA_EA: 0x822E8E4
+// IDA_NAME: _ZN30PCK_AUCTION_BUY_ITEM_APIECE_GAC2Ev
+// DEMANGLED: PCK_AUCTION_BUY_ITEM_APIECE_GA::PCK_AUCTION_BUY_ITEM_APIECE_GA(void)
+PCK_AUCTION_BUY_ITEM_APIECE_GA::PCK_AUCTION_BUY_ITEM_APIECE_GA() {
+    std::memset(this, 0, 0x2au);
+    setCategory(0);
+    setPacketID(14);
+    setSize(42);
+}

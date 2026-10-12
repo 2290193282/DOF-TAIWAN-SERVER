@@ -1,0 +1,6 @@
+#ifndef OLDSRV_DATAMANAGER_PREMIUM_ITEM_DATA_H_
+#define OLDSRV_DATAMANAGER_PREMIUM_ITEM_DATA_H_
+
+#include "old_data/PVF/data/premium_item_data.h"
+
+#endif  // OLDSRV_DATAMANAGER_PREMIUM_ITEM_DATA_H_

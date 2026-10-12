@@ -1,0 +1,7 @@
+#ifndef OLDSRV_DATAMANAGER_PRESENT_RESPONSE_SCRIPT_EXCEPTION_FORWARD_H_
+#define OLDSRV_DATAMANAGER_PRESENT_RESPONSE_SCRIPT_EXCEPTION_FORWARD_H_
+
+// Canonical PVF event declarations are owned by B.
+#include "old_data/PVF/event/present_response_script_exception.h"
+
+#endif  // OLDSRV_DATAMANAGER_PRESENT_RESPONSE_SCRIPT_EXCEPTION_FORWARD_H_

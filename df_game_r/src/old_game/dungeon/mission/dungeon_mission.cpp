@@ -1,0 +1,2020 @@
+#include "old_game/dungeon/mission/dungeon_mission.h"
+
+#include <algorithm>
+#include <map>
+#include <set>
+#include <stdint.h>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "old_data/PVF/common/datamanager/dnf_lex.h"
+#include "old_data/PVF/common/datamanager/rdar_script.h"
+#include "old_data/PVF/data/datamanager/data_manager.h"
+#include "old_game/economy/inventory/item.h"
+#include "old_game/economy/inventory/inventory.h"
+#include "old_game/player/core/cuser.h"
+#include "old_game/pvp/battlefield/battle_field.h"
+#include "old_game/social/party/party.h"
+#include "common/manager/global_data.h"
+#include "common/manager/global_lifecycle.h"
+#include "common/manager/server_utility.h"
+#include "common/manager/system_time.h"
+#include "infra/log/format/trace.h"
+#include "infra/network/packet/PacketEnum.h"
+#include "infra/network/packet/interface_packet_buf.h"
+#include "infra/network/packet/packet_buf.h"
+#include "infra/network/packet/packet_guard.h"
+
+namespace dungeon_mission {
+enum MissionType {
+    MISSION_HIDDEN_MONSTER = 0,
+    MISSION_TREASURE_BOX = 1,
+    MISSION_SECRET_PATH = 2,
+    MISSION_TIME_ATTACK = 3,
+    MISSION_BOSS_ATTACK = 4
+};
+
+namespace {
+
+const char kDungeonMissionPath[] =
+    "Etc/DungeonEtc/DungeonMission.etc";
+const char kDungeonMissionDiagFile[] = "dungeon_mission_diag.cpp";
+const int kMissionErrorOperationFailed = 1;
+const int kMissionRewardItemCount = 1;
+
+struct WeightedReward {
+    WeightedReward() : item_id(0), weight(0) {}
+    WeightedReward(int item, int reward_weight)
+        : item_id(item), weight(reward_weight) {}
+
+    int item_id;
+    int weight;
+};
+
+struct MissionDefinition {
+    MissionDefinition()
+        : npc_index(-1),
+          type(-1),
+          dummy_count(0),
+          rate(-1),
+          time_limit(-1),
+          timer_time(0),
+          summon_monster_index(-1),
+          dummy_index(-1),
+          summon_apc_indices(),
+          summon_object_index(-1) {}
+
+    int npc_index;
+    int type;
+    int dummy_count;
+    int rate;
+    int time_limit;
+    int timer_time;
+    int summon_monster_index;
+    int dummy_index;
+    std::vector<int> summon_apc_indices;
+    int summon_object_index;
+};
+
+struct MissionCohort {
+    MissionCohort()
+        : cohort_id(-1), missions(), dungeon_indices(), rewards() {}
+
+    int cohort_id;
+    std::vector<MissionDefinition> missions;
+    std::vector<int> dungeon_indices;
+    std::vector<WeightedReward> rewards;
+};
+
+struct MissionConfig {
+    MissionConfig()
+        : mission_rate(-1),
+          additional_rate(-1),
+          force_start_count(-1),
+          cohorts() {}
+
+    int mission_rate;
+    int additional_rate;
+    int force_start_count;
+    std::vector<MissionCohort> cohorts;
+};
+
+struct UserProgress {
+    UserProgress()
+        : started(false),
+          started_at(0u),
+          confirmed_positions(),
+          rewarded(false),
+          reward_item_id(0) {}
+
+    bool started;
+    uint32_t started_at;
+    std::set<std::pair<int, int> > confirmed_positions;
+    bool rewarded;
+    int reward_item_id;
+};
+
+struct PartyMissionState {
+    PartyMissionState()
+        : prepared(false),
+          offered(false),
+          dungeon_index(0),
+          definition(),
+          rewards(),
+          npc_position(-1, -1),
+          primary_position(-1, -1),
+          secondary_positions(),
+          objective_positions(),
+          summon_apc_index(-1),
+          summon_object_index(-1),
+          any_started(false),
+          users() {}
+
+    bool prepared;
+    bool offered;
+    int dungeon_index;
+    MissionDefinition definition;
+    std::vector<WeightedReward> rewards;
+    // NOTI28 uses this room only to place/contact the mission NPC.  CMD552
+    // supplies the independent objective layout after that contact succeeds.
+    std::pair<int, int> npc_position;
+    std::pair<int, int> primary_position;
+    // Type 0/1: decoy positions. Type 3: all ordered target positions,
+    // including primary_position as the first element.
+    std::vector<std::pair<int, int> > secondary_positions;
+    std::vector<std::pair<int, int> > objective_positions;
+    int summon_apc_index;
+    int summon_object_index;
+    // START_MAP is party-scoped and has no requesting-user argument.  Once any
+    // member starts the mission, keep its room resources enabled for the run;
+    // each member's reward deadline remains authoritative in UserProgress.
+    bool any_started;
+    std::map<int, UserProgress> users;
+};
+
+typedef std::map<CParty*, PartyMissionState> PartyStateMap;
+typedef std::map<int, int> MissionMissCountMap;
+
+PartyStateMap& PartyStates() {
+    static PartyStateMap states;
+    return states;
+}
+
+MissionMissCountMap& MissionMissCounts() {
+    // RECONSTRUCTED_0828/session-only: the client/PVF proves the increasing
+    // offer probability and force count, but exposes no cross-login storage
+    // key.  Do not invent a DB table from a probability policy alone.
+    static MissionMissCountMap counts;
+    return counts;
+}
+
+class RdarUnloadGuard {
+public:
+    RdarUnloadGuard() {}
+    ~RdarUnloadGuard() { unloadRDARScriptFile(); }
+
+private:
+    RdarUnloadGuard(const RdarUnloadGuard&);
+    RdarUnloadGuard& operator=(const RdarUnloadGuard&);
+};
+
+int MissionTypeFromText(const std::string& text) {
+    if (text == "hidden monster") {
+        return MISSION_HIDDEN_MONSTER;
+    }
+    if (text == "treasure box") {
+        return MISSION_TREASURE_BOX;
+    }
+    if (text == "secret path") {
+        return MISSION_SECRET_PATH;
+    }
+    if (text == "time attack") {
+        return MISSION_TIME_ATTACK;
+    }
+    if (text == "boss attack") {
+        return MISSION_BOSS_ATTACK;
+    }
+    return -1;
+}
+
+bool ValidateMission(const MissionDefinition& mission) {
+    if (mission.npc_index <= 0 || mission.type < MISSION_HIDDEN_MONSTER ||
+        mission.type > MISSION_BOSS_ATTACK || mission.rate <= 0 ||
+        mission.time_limit <= 0 || mission.time_limit > 0xffff ||
+        mission.dummy_count < 0 || mission.dummy_count > 0xff) {
+        return false;
+    }
+
+    if ((mission.type == MISSION_TREASURE_BOX ||
+         mission.type == MISSION_SECRET_PATH ||
+         mission.type == MISSION_BOSS_ATTACK) &&
+        mission.summon_apc_indices.empty()) {
+        return false;
+    }
+    if ((mission.type == MISSION_TREASURE_BOX ||
+         mission.type == MISSION_SECRET_PATH) &&
+        mission.summon_object_index <= 0) {
+        return false;
+    }
+    if (mission.type == MISSION_HIDDEN_MONSTER &&
+        (mission.dummy_count <= 0 || mission.timer_time <= 0 ||
+         mission.summon_monster_index <= 0 || mission.dummy_index <= 0)) {
+        return false;
+    }
+    if (mission.type == MISSION_TREASURE_BOX &&
+        mission.dummy_count <= 0) {
+        return false;
+    }
+    if (mission.type == MISSION_SECRET_PATH &&
+        mission.summon_monster_index <= 0) {
+        return false;
+    }
+    if (mission.type == MISSION_TIME_ATTACK &&
+        (mission.dummy_count <= 0 || mission.summon_monster_index <= 0)) {
+        return false;
+    }
+    return true;
+}
+
+bool ValidateConfig(const MissionConfig& config) {
+    if (config.mission_rate < 0 || config.mission_rate > 100 ||
+        config.additional_rate < 0 || config.additional_rate > 100 ||
+        config.force_start_count <= 0 || config.cohorts.empty()) {
+        return false;
+    }
+
+    std::set<int> cohort_ids;
+    std::set<int> dungeon_ids;
+    for (std::vector<MissionCohort>::const_iterator cohort =
+             config.cohorts.begin();
+         cohort != config.cohorts.end(); ++cohort) {
+        if (cohort->cohort_id < 0 || cohort->missions.empty() ||
+            cohort->dungeon_indices.empty() || cohort->rewards.empty() ||
+            !cohort_ids.insert(cohort->cohort_id).second) {
+            return false;
+        }
+
+        std::set<int> mission_types;
+        int mission_weight = 0;
+        for (std::vector<MissionDefinition>::const_iterator mission =
+                 cohort->missions.begin();
+             mission != cohort->missions.end(); ++mission) {
+            if (!ValidateMission(*mission) ||
+                !mission_types.insert(mission->type).second) {
+                return false;
+            }
+            mission_weight += mission->rate;
+        }
+        if (mission_weight <= 0) {
+            return false;
+        }
+
+        for (std::vector<int>::const_iterator dungeon =
+                 cohort->dungeon_indices.begin();
+             dungeon != cohort->dungeon_indices.end(); ++dungeon) {
+            if (*dungeon <= 0 || !dungeon_ids.insert(*dungeon).second) {
+                return false;
+            }
+        }
+
+        int reward_weight = 0;
+        for (std::vector<WeightedReward>::const_iterator reward =
+                 cohort->rewards.begin();
+             reward != cohort->rewards.end(); ++reward) {
+            if (reward->item_id <= 0 || reward->weight <= 0) {
+                return false;
+            }
+            reward_weight += reward->weight;
+        }
+        if (reward_weight <= 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ValidateLoadedResources(const MissionConfig& config) {
+    CDataManager* const data_manager = G_CDataManager();
+    if (!data_manager) {
+        return false;
+    }
+
+    for (std::vector<MissionCohort>::const_iterator cohort =
+             config.cohorts.begin();
+         cohort != config.cohorts.end(); ++cohort) {
+        for (std::vector<int>::const_iterator dungeon =
+                 cohort->dungeon_indices.begin();
+             dungeon != cohort->dungeon_indices.end(); ++dungeon) {
+            if (!data_manager->find_dungeon(*dungeon)) {
+                return false;
+            }
+        }
+
+        for (std::vector<WeightedReward>::const_iterator reward =
+                 cohort->rewards.begin();
+             reward != cohort->rewards.end(); ++reward) {
+            CItem* const item = data_manager->find_item(reward->item_id);
+            if (!item || item->is_stackable() != 1) {
+                return false;
+            }
+        }
+
+        for (std::vector<MissionDefinition>::const_iterator mission =
+                 cohort->missions.begin();
+             mission != cohort->missions.end(); ++mission) {
+            if (mission->type == MISSION_HIDDEN_MONSTER &&
+                (!data_manager->find_monster(
+                     mission->summon_monster_index) ||
+                 !data_manager->find_monster(mission->dummy_index))) {
+                return false;
+            }
+            if (mission->type == MISSION_TIME_ATTACK &&
+                !data_manager->find_monster(
+                    mission->summon_monster_index)) {
+                return false;
+            }
+            // The secret-path field named [summon monster index] is 15153
+            // in the 0828 PVF, but that ID belongs to passiveobject.lst
+            // (ActionObject/Map/Mission/gate.obj), not monster.lst.  Do not
+            // reinterpret the field name and reject the official resource.
+        }
+    }
+    return true;
+}
+
+bool ParseConfig(MissionConfig& config) {
+    MissionCohort* cohort = 0;
+    MissionDefinition* mission = 0;
+    std::string current_tag;
+    int pending_reward_item = 0;
+    bool reward_needs_weight = false;
+
+    for (;;) {
+        int integer_value = 0;
+        float float_value = 0.0f;
+        std::string text;
+        const DNFLEX_TOKEN token =
+            ScanAll(&integer_value, &float_value, &text);
+        if (token == DNF_TOK_EOF) {
+            break;
+        }
+
+        if (token == DNF_TOK_TYPE) {
+            if (text == "[mission info]") {
+                if (cohort || mission) {
+                    return false;
+                }
+                config.cohorts.push_back(MissionCohort());
+                cohort = &config.cohorts.back();
+                current_tag = text;
+            } else if (text == "[/mission info]") {
+                if (!cohort || mission || reward_needs_weight) {
+                    return false;
+                }
+                cohort = 0;
+                current_tag.clear();
+            } else if (text == "[mission]") {
+                if (!cohort || mission) {
+                    return false;
+                }
+                cohort->missions.push_back(MissionDefinition());
+                mission = &cohort->missions.back();
+                current_tag.clear();
+            } else if (text == "[/mission]") {
+                if (!mission) {
+                    return false;
+                }
+                mission = 0;
+                current_tag.clear();
+            } else if (text == "[/summon apc index]" ||
+                       text == "[/dungeon index]") {
+                current_tag.clear();
+            } else if (text == "[/reward info]") {
+                if (reward_needs_weight) {
+                    return false;
+                }
+                current_tag.clear();
+            } else {
+                current_tag = text;
+            }
+            continue;
+        }
+
+        if (token == DNF_TOK_STRING) {
+            if (!mission || current_tag != "[mission type]" ||
+                mission->type != -1) {
+                return false;
+            }
+            mission->type = MissionTypeFromText(text);
+            if (mission->type < 0) {
+                return false;
+            }
+            current_tag.clear();
+            continue;
+        }
+
+        if (token != DNF_TOK_DECIMAL && token != DNF_TOK_HEXADECIMAL) {
+            continue;
+        }
+
+        if (current_tag == "[mission rate]") {
+            if (config.mission_rate != -1) {
+                return false;
+            }
+            config.mission_rate = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[mission additional rate]") {
+            if (config.additional_rate != -1) {
+                return false;
+            }
+            config.additional_rate = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[mission force start count]") {
+            if (config.force_start_count != -1) {
+                return false;
+            }
+            config.force_start_count = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[mission info]") {
+            if (!cohort || cohort->cohort_id != -1) {
+                return false;
+            }
+            cohort->cohort_id = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[npc index]") {
+            if (!mission || mission->npc_index != -1) {
+                return false;
+            }
+            mission->npc_index = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[dummy count]") {
+            if (!mission) {
+                return false;
+            }
+            mission->dummy_count = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[rate]") {
+            if (!mission || mission->rate != -1) {
+                return false;
+            }
+            mission->rate = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[time limit]") {
+            if (!mission || mission->time_limit != -1) {
+                return false;
+            }
+            mission->time_limit = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[timer time]") {
+            if (!mission) {
+                return false;
+            }
+            mission->timer_time = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[summon monster index]") {
+            if (!mission || mission->summon_monster_index != -1) {
+                return false;
+            }
+            mission->summon_monster_index = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[dummy index]") {
+            if (!mission || mission->dummy_index != -1) {
+                return false;
+            }
+            mission->dummy_index = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[summon apc index]") {
+            if (!mission || integer_value <= 0) {
+                return false;
+            }
+            mission->summon_apc_indices.push_back(integer_value);
+        } else if (current_tag == "[summon object index]") {
+            if (!mission || mission->summon_object_index != -1) {
+                return false;
+            }
+            mission->summon_object_index = integer_value;
+            current_tag.clear();
+        } else if (current_tag == "[dungeon index]") {
+            if (!cohort || mission) {
+                return false;
+            }
+            cohort->dungeon_indices.push_back(integer_value);
+        } else if (current_tag == "[reward info]") {
+            if (!cohort || mission) {
+                return false;
+            }
+            if (!reward_needs_weight) {
+                pending_reward_item = integer_value;
+                reward_needs_weight = true;
+            } else {
+                cohort->rewards.push_back(
+                    WeightedReward(pending_reward_item, integer_value));
+                pending_reward_item = 0;
+                reward_needs_weight = false;
+            }
+        }
+    }
+
+    return !cohort && !mission && !reward_needs_weight &&
+           ValidateConfig(config);
+}
+
+const MissionConfig* GetMissionConfig() {
+    static bool attempted = false;
+    static bool valid = false;
+    static MissionConfig config;
+    if (attempted) {
+        return valid ? &config : 0;
+    }
+    attempted = true;
+
+    if (loadRDARScriptFile("", kDungeonMissionPath) != 1) {
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "const MissionConfig* dungeon_mission::GetMissionConfig()",
+            0,
+            "[DUNGEON_MISSION][CONFIG_FAIL] reason=load path=%s",
+            kDungeonMissionPath);
+        return 0;
+    }
+    RdarUnloadGuard unload;
+    MissionConfig parsed;
+    const bool parsed_ok = ParseConfig(parsed);
+    const bool resources_ok = parsed_ok && ValidateLoadedResources(parsed);
+    if (!parsed_ok || !resources_ok) {
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "const MissionConfig* dungeon_mission::GetMissionConfig()",
+            0,
+            "[DUNGEON_MISSION][CONFIG_FAIL] reason=%s path=%s cohorts=%d",
+            parsed_ok ? "resource_validation" : "parse",
+            kDungeonMissionPath,
+            static_cast<int>(parsed.cohorts.size()));
+        return 0;
+    }
+    config = parsed;
+    valid = true;
+    LogManager::logFormat(
+        1,
+        kDungeonMissionDiagFile,
+        "const MissionConfig* dungeon_mission::GetMissionConfig()",
+        0,
+        "[DUNGEON_MISSION][CONFIG_OK] rate=%d additional=%d force=%d cohorts=%d",
+        config.mission_rate,
+        config.additional_rate,
+        config.force_start_count,
+        static_cast<int>(config.cohorts.size()));
+    return &config;
+}
+
+const MissionCohort* FindCohort(const MissionConfig& config,
+                                int dungeon_index) {
+    for (std::vector<MissionCohort>::const_iterator cohort =
+             config.cohorts.begin();
+         cohort != config.cohorts.end(); ++cohort) {
+        if (std::find(cohort->dungeon_indices.begin(),
+                      cohort->dungeon_indices.end(),
+                      dungeon_index) != cohort->dungeon_indices.end()) {
+            return &*cohort;
+        }
+    }
+    return 0;
+}
+
+const MissionDefinition* SelectMission(const MissionCohort& cohort) {
+    int total_weight = 0;
+    for (std::vector<MissionDefinition>::const_iterator mission =
+             cohort.missions.begin();
+         mission != cohort.missions.end(); ++mission) {
+        total_weight += mission->rate;
+    }
+    if (total_weight <= 0) {
+        return 0;
+    }
+
+    int roll = static_cast<int>(get_rand_int(total_weight));
+    for (std::vector<MissionDefinition>::const_iterator mission =
+             cohort.missions.begin();
+         mission != cohort.missions.end(); ++mission) {
+        if (roll < mission->rate) {
+            return &*mission;
+        }
+        roll -= mission->rate;
+    }
+    return 0;
+}
+
+int SelectApcIndex(const MissionDefinition& mission) {
+    if (mission.summon_apc_indices.empty()) {
+        return -1;
+    }
+    const unsigned int index = get_rand_int(
+        static_cast<int>(mission.summon_apc_indices.size()));
+    return mission.summon_apc_indices[index];
+}
+
+int SelectRewardItem(const PartyMissionState& state) {
+    int total_weight = 0;
+    for (std::vector<WeightedReward>::const_iterator reward =
+             state.rewards.begin();
+         reward != state.rewards.end(); ++reward) {
+        total_weight += reward->weight;
+    }
+    if (total_weight <= 0) {
+        return 0;
+    }
+
+    int roll = static_cast<int>(get_rand_int(total_weight));
+    for (std::vector<WeightedReward>::const_iterator reward =
+             state.rewards.begin();
+         reward != state.rewards.end(); ++reward) {
+        if (roll < reward->weight) {
+            return reward->item_id;
+        }
+        roll -= reward->weight;
+    }
+    return 0;
+}
+
+int GetCharacterNo(CUser* user) {
+    return user && user->getCurCharacR() ? user->get_charac_no(-1) : 0;
+}
+
+int GetAccountId(CUser* user) {
+    return user ? user->get_acc_id() : 0;
+}
+
+void GetCurrentRoom(CParty* party, int& pos_x, int& pos_y) {
+    pos_x = -1;
+    pos_y = -1;
+    if (party) {
+        party->battle_field().getCurPosXY(pos_x, pos_y);
+    }
+}
+
+void GetObjectiveForTrace(const PartyMissionState& state,
+                          size_t index,
+                          int& pos_x,
+                          int& pos_y) {
+    pos_x = -1;
+    pos_y = -1;
+    if (index < state.objective_positions.size()) {
+        pos_x = state.objective_positions[index].first;
+        pos_y = state.objective_positions[index].second;
+    }
+}
+
+int GetObjectiveIndex(const PartyMissionState& state,
+                      const std::pair<int, int>& position) {
+    for (size_t index = 0; index < state.objective_positions.size(); ++index) {
+        if (state.objective_positions[index] == position) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+int PacketDeclaredLength(PacketBuf& packet) {
+    const CS_Header* const header =
+        reinterpret_cast<const CS_Header*>(packet.get_packet(0));
+    return header ? static_cast<int>(header->length) : -1;
+}
+
+uint32_t CurrentSecond() {
+    CSystemTime* const system_time = GlobalData::system_time();
+    return static_cast<uint32_t>(
+        system_time ? system_time->getCurSec() : 0);
+}
+
+uint32_t ElapsedSeconds(const UserProgress* progress, uint32_t now) {
+    if (!progress || !progress->started_at || !now ||
+        now < progress->started_at) {
+        return 0u;
+    }
+    return now - progress->started_at;
+}
+
+bool IsExpired(const PartyMissionState& state,
+               const UserProgress& progress) {
+    if (!progress.started || !progress.started_at) {
+        return true;
+    }
+    const uint32_t now = CurrentSecond();
+    if (!now || now < progress.started_at) {
+        return false;
+    }
+    return now - progress.started_at >=
+           static_cast<uint32_t>(state.definition.time_limit);
+}
+
+bool IsObjectivePosition(const PartyMissionState& state,
+                         const std::pair<int, int>& position) {
+    return std::find(state.objective_positions.begin(),
+                     state.objective_positions.end(),
+                     position) != state.objective_positions.end();
+}
+
+bool AllClientConfirmationsPresent(const PartyMissionState& state,
+                                   const UserProgress& progress) {
+    if (state.definition.type == MISSION_TREASURE_BOX ||
+        state.definition.type == MISSION_BOSS_ATTACK) {
+        // CLIENT_IDA_EVIDENCE: type 1/4 local role callbacks issue CMD554
+        // directly and never issue CMD553.  Their completion proof is the
+        // running, unexpired mission plus that one-shot CMD554 request.
+        return true;
+    }
+    for (std::vector<std::pair<int, int> >::const_iterator objective =
+             state.objective_positions.begin();
+         objective != state.objective_positions.end(); ++objective) {
+        if (progress.confirmed_positions.find(*objective) ==
+            progress.confirmed_positions.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsMissionComplete(const PartyMissionState& state,
+                       const UserProgress& progress) {
+    return AllClientConfirmationsPresent(state, progress);
+}
+
+void PrepareState(CParty* party,
+                  CBattle_Field* battle_field,
+                  PartyMissionState& state) {
+    state = PartyMissionState();
+    state.prepared = true;
+    if (!party || !battle_field) {
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "void dungeon_mission::PrepareState(CParty*,CBattle_Field*,PartyMissionState&)",
+            0,
+            "[DUNGEON_MISSION][PREPARE_FAIL] reason=null_context party=%p battlefield=%p",
+            party,
+            battle_field);
+        return;
+    }
+
+    state.dungeon_index = battle_field->get_dungeon_index();
+    const MissionConfig* const config = GetMissionConfig();
+    const MissionCohort* const cohort = config
+        ? FindCohort(*config, state.dungeon_index)
+        : 0;
+    CUser* const manager = party->getManager();
+    const int manager_charac_no = GetCharacterNo(manager);
+    if (!config || !cohort || manager_charac_no <= 0) {
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "void dungeon_mission::PrepareState(CParty*,CBattle_Field*,PartyMissionState&)",
+            0,
+            "[DUNGEON_MISSION][PREPARE_FAIL] reason=prerequisite account=%d charac=%d dungeon=%d config=%d cohort=%d",
+            GetAccountId(manager),
+            manager_charac_no,
+            state.dungeon_index,
+            config ? 1 : 0,
+            cohort ? 1 : 0);
+        return;
+    }
+
+    int& miss_count = MissionMissCounts()[manager_charac_no];
+    const bool force_start =
+        miss_count + 1 >= config->force_start_count;
+    const int effective_rate = std::min(
+        100, config->mission_rate + config->additional_rate * miss_count);
+    const int offer_roll = force_start
+        ? -1
+        : static_cast<int>(get_rand_int(100));
+    if (!force_start && offer_roll >= effective_rate) {
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "void dungeon_mission::PrepareState(CParty*,CBattle_Field*,PartyMissionState&)",
+            0,
+            "[DUNGEON_MISSION][NO_OFFER] account=%d charac=%d dungeon=%d miss_before=%d rate=%d roll=%d force=%d",
+            GetAccountId(manager),
+            manager_charac_no,
+            state.dungeon_index,
+            miss_count,
+            effective_rate,
+            offer_roll,
+            force_start ? 1 : 0);
+        ++miss_count;
+        return;
+    }
+
+    const MissionDefinition* const selected = SelectMission(*cohort);
+    if (!selected) {
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "void dungeon_mission::PrepareState(CParty*,CBattle_Field*,PartyMissionState&)",
+            0,
+            "[DUNGEON_MISSION][PREPARE_FAIL] reason=select account=%d charac=%d dungeon=%d cohort=%d",
+            GetAccountId(manager),
+            manager_charac_no,
+            state.dungeon_index,
+            cohort->cohort_id);
+        return;
+    }
+
+    std::pair<int, int> npc_position(-1, -1);
+    std::pair<int, int> primary(-1, -1);
+    std::vector<std::pair<int, int> > secondary;
+    if (!battle_field->BuildDungeonMissionCoordinates(
+            selected->type,
+            selected->dummy_count,
+            npc_position,
+            primary,
+            secondary)) {
+        // Selection is deliberately fail-closed.  Do not count a mission
+        // whose PVF shape cannot be placed on this concrete maze.
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "void dungeon_mission::PrepareState(CParty*,CBattle_Field*,PartyMissionState&)",
+            0,
+            "[DUNGEON_MISSION][PREPARE_FAIL] reason=layout account=%d charac=%d dungeon=%d cohort=%d type=%d requested=%d",
+            GetAccountId(manager),
+            manager_charac_no,
+            state.dungeon_index,
+            cohort->cohort_id,
+            selected->type,
+            selected->dummy_count);
+        return;
+    }
+
+    state.definition = *selected;
+    state.rewards = cohort->rewards;
+    state.npc_position = npc_position;
+    state.primary_position = primary;
+    state.secondary_positions = secondary;
+    state.summon_apc_index = SelectApcIndex(*selected);
+    state.summon_object_index = selected->summon_object_index;
+    if (selected->type == MISSION_TIME_ATTACK) {
+        state.objective_positions = secondary;
+    } else {
+        state.objective_positions.push_back(primary);
+    }
+
+    if (state.objective_positions.empty() ||
+        ((selected->type == MISSION_TREASURE_BOX ||
+          selected->type == MISSION_SECRET_PATH ||
+          selected->type == MISSION_BOSS_ATTACK) &&
+         state.summon_apc_index <= 0) ||
+        ((selected->type == MISSION_TREASURE_BOX ||
+          selected->type == MISSION_SECRET_PATH) &&
+         state.summon_object_index <= 0)) {
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "void dungeon_mission::PrepareState(CParty*,CBattle_Field*,PartyMissionState&)",
+            0,
+            "[DUNGEON_MISSION][PREPARE_FAIL] reason=shape account=%d charac=%d dungeon=%d type=%d objectives=%d apc=%d object=%d monster=%d",
+            GetAccountId(manager),
+            manager_charac_no,
+            state.dungeon_index,
+            selected->type,
+            static_cast<int>(state.objective_positions.size()),
+            state.summon_apc_index,
+            state.summon_object_index,
+            state.definition.summon_monster_index);
+        return;
+    }
+
+    miss_count = 0;
+    state.offered = true;
+    int objective0_x = -1;
+    int objective0_y = -1;
+    int objective1_x = -1;
+    int objective1_y = -1;
+    GetObjectiveForTrace(state, 0u, objective0_x, objective0_y);
+    GetObjectiveForTrace(state, 1u, objective1_x, objective1_y);
+    LogManager::logFormat(
+        1,
+        kDungeonMissionDiagFile,
+        "void dungeon_mission::PrepareState(CParty*,CBattle_Field*,PartyMissionState&)",
+        0,
+        "[DUNGEON_MISSION][OFFER] account=%d charac=%d dungeon=%d cohort=%d type=%d npc=%d npc_room=%d,%d primary=%d,%d objectives=%d obj0=%d,%d obj1=%d,%d time=%d monster=%d apc=%d object=%d force=%d roll=%d rate=%d",
+        GetAccountId(manager),
+        manager_charac_no,
+        state.dungeon_index,
+        cohort->cohort_id,
+        state.definition.type,
+        state.definition.npc_index,
+        state.npc_position.first,
+        state.npc_position.second,
+        state.primary_position.first,
+        state.primary_position.second,
+        static_cast<int>(state.objective_positions.size()),
+        objective0_x,
+        objective0_y,
+        objective1_x,
+        objective1_y,
+        state.definition.time_limit,
+        state.definition.summon_monster_index,
+        state.summon_apc_index,
+        state.summon_object_index,
+        force_start ? 1 : 0,
+        offer_roll,
+        effective_rate);
+}
+
+PartyMissionState* FindState(CUser* user) {
+    if (!user || user->get_state() != 5 || !user->getCurCharacR()) {
+        return 0;
+    }
+    CParty* const party = user->GetParty();
+    if (!party) {
+        return 0;
+    }
+    PartyStateMap::iterator found = PartyStates().find(party);
+    if (found == PartyStates().end() || !found->second.prepared ||
+        !found->second.offered ||
+        found->second.dungeon_index !=
+            party->battle_field().get_dungeon_index()) {
+        return 0;
+    }
+    return &found->second;
+}
+
+const char* FindStateFailureReason(CUser* user) {
+    if (!user) {
+        return "user_null";
+    }
+    if (user->get_state() != 5) {
+        return "user_state";
+    }
+    if (!user->getCurCharacR()) {
+        return "charac_missing";
+    }
+    CParty* const party = user->GetParty();
+    if (!party) {
+        return "party_missing";
+    }
+    PartyStateMap::iterator found = PartyStates().find(party);
+    if (found == PartyStates().end()) {
+        return "party_state_missing";
+    }
+    if (!found->second.prepared) {
+        return "not_prepared";
+    }
+    if (!found->second.offered) {
+        return "not_offered";
+    }
+    if (found->second.dungeon_index !=
+        party->battle_field().get_dungeon_index()) {
+        return "dungeon_mismatch";
+    }
+    return "none";
+}
+
+UserProgress* FindOrCreateProgress(CUser* user,
+                                   PartyMissionState& state) {
+    const int charac_no = GetCharacterNo(user);
+    if (charac_no <= 0) {
+        return 0;
+    }
+    return &state.users[charac_no];
+}
+
+UserProgress* FindProgress(CUser* user, PartyMissionState& state) {
+    const int charac_no = GetCharacterNo(user);
+    if (charac_no <= 0) {
+        return 0;
+    }
+    std::map<int, UserProgress>::iterator found =
+        state.users.find(charac_no);
+    return found == state.users.end() ? 0 : &found->second;
+}
+
+void SendCommandError(CUser* user, int command) {
+    if (user) {
+        user->SendCmdErrorPacket(
+            static_cast<ENUM_CMDPACKET>(command),
+            static_cast<unsigned char>(kMissionErrorOperationFailed));
+    }
+}
+
+void TraceUpdate(CUser* user,
+                 PacketBuf& packet,
+                 const char* result,
+                 const char* reason,
+                 int request_type,
+                 int pos_x,
+                 int pos_y,
+                 PartyMissionState* state,
+                 UserProgress* progress,
+                 CParty* party) {
+    int current_x = -1;
+    int current_y = -1;
+    GetCurrentRoom(party, current_x, current_y);
+    const uint32_t now = CurrentSecond();
+    const std::pair<int, int> request_position(pos_x, pos_y);
+    LogManager::logFormat(
+        1,
+        kDungeonMissionDiagFile,
+        "int dungeon_mission::HandleUpdate(CUser*,PacketBuf&)",
+        0,
+        "[DUNGEON_MISSION][CMD553] result=%s reason=%s party=%d account=%d charac=%d dungeon=%d type=%d request_type=%d request_room=%d,%d current_room=%d,%d target=%d started=%d started_at=%u now=%u elapsed=%u limit=%d confirmed=%d expected=%d cursor=%d declared=%d packet_error=%d",
+        result,
+        reason,
+        party ? party->GetPartyIndex() : -1,
+        GetAccountId(user),
+        GetCharacterNo(user),
+        state ? state->dungeon_index
+              : (party ? party->battle_field().get_dungeon_index() : -1),
+        state ? state->definition.type : -1,
+        request_type,
+        pos_x,
+        pos_y,
+        current_x,
+        current_y,
+        state ? GetObjectiveIndex(*state, request_position) : -1,
+        progress && progress->started ? 1 : 0,
+        progress ? progress->started_at : 0u,
+        now,
+        ElapsedSeconds(progress, now),
+        state ? state->definition.time_limit : -1,
+        progress
+            ? static_cast<int>(progress->confirmed_positions.size())
+            : -1,
+        state ? static_cast<int>(state->objective_positions.size()) : -1,
+        packet.get_index(),
+        PacketDeclaredLength(packet),
+        static_cast<int>(packet.getLastError()));
+}
+
+void TraceCheck(CUser* user,
+                PacketBuf& packet,
+                const char* result,
+                const char* reason,
+                int reward_item_id,
+                PartyMissionState* state,
+                UserProgress* progress,
+                CParty* party) {
+    int current_x = -1;
+    int current_y = -1;
+    GetCurrentRoom(party, current_x, current_y);
+    const uint32_t now = CurrentSecond();
+    const int expected = state
+        ? static_cast<int>(state->objective_positions.size())
+        : -1;
+    const int confirmed = progress
+        ? static_cast<int>(progress->confirmed_positions.size())
+        : -1;
+    LogManager::logFormat(
+        1,
+        kDungeonMissionDiagFile,
+        "int dungeon_mission::HandleCheckSuccess(CUser*,PacketBuf&)",
+        0,
+        "[DUNGEON_MISSION][CMD554] result=%s reason=%s party=%d account=%d charac=%d dungeon=%d type=%d room=%d,%d started=%d started_at=%u now=%u elapsed=%u limit=%d confirmed=%d expected=%d missing=%d rewarded=%d reward_item=%d cursor=%d declared=%d packet_error=%d",
+        result,
+        reason,
+        party ? party->GetPartyIndex() : -1,
+        GetAccountId(user),
+        GetCharacterNo(user),
+        state ? state->dungeon_index
+              : (party ? party->battle_field().get_dungeon_index() : -1),
+        state ? state->definition.type : -1,
+        current_x,
+        current_y,
+        progress && progress->started ? 1 : 0,
+        progress ? progress->started_at : 0u,
+        now,
+        ElapsedSeconds(progress, now),
+        state ? state->definition.time_limit : -1,
+        confirmed,
+        expected,
+        expected >= 0 && confirmed >= 0 ? expected - confirmed : -1,
+        progress && progress->rewarded ? 1 : 0,
+        reward_item_id,
+        packet.get_index(),
+        PacketDeclaredLength(packet),
+        static_cast<int>(packet.getLastError()));
+}
+
+bool PacketBodyConsumed(PacketBuf& packet) {
+    // The C2S length retains the eight-byte encrypted body extent.  For
+    // CMD553 type 3 the semantic cursor is 16 (13 + 3), while the wire
+    // header says 21 (13 + 8).  Accept only that exact block-rounding tail,
+    // or a caller that has already normalized the semantic length.
+    if (packet.getLastError() != PacketBuf::PACKETBUF_ERROR_NONE) {
+        return false;
+    }
+    const CS_Header* const header =
+        reinterpret_cast<const CS_Header*>(packet.get_packet(0));
+    const int cursor = packet.get_index();
+    const int header_size = static_cast<int>(sizeof(CS_Header));
+    if (!header || cursor < header_size || header->length < cursor) {
+        return false;
+    }
+    const int padded_length = header_size + ((cursor - header_size + 7) & ~7);
+    return header->length == cursor || header->length == padded_length;
+}
+
+void SendStartResponse(CUser* user, const PartyMissionState& state) {
+    PacketGuard response;
+    response.put_header(1, ENUM_CMDPACKET_DUNGEON_MISSION_START);
+    response.put_byte(1);
+    response.put_short(state.definition.time_limit);
+    response.put_byte(state.definition.type);
+
+    switch (state.definition.type) {
+    case MISSION_HIDDEN_MONSTER:
+        response.put_byte(state.primary_position.first);
+        response.put_byte(state.primary_position.second);
+        response.put_byte(
+            static_cast<int>(state.secondary_positions.size()));
+        for (std::vector<std::pair<int, int> >::const_iterator position =
+                 state.secondary_positions.begin();
+             position != state.secondary_positions.end(); ++position) {
+            response.put_byte(position->first);
+            response.put_byte(position->second);
+        }
+        break;
+    case MISSION_TREASURE_BOX:
+        // CLIENT_IDA_EVIDENCE: CMD552 sub_5DF790 stores this u32 in
+        // mission this[9]; type-1 vtable sub_5E0440 creates role 273 from it.
+        response.put_int(state.summon_apc_index);
+        response.put_byte(state.primary_position.first);
+        response.put_byte(state.primary_position.second);
+        response.put_byte(
+            static_cast<int>(state.secondary_positions.size()));
+        for (std::vector<std::pair<int, int> >::const_iterator position =
+                 state.secondary_positions.begin();
+             position != state.secondary_positions.end(); ++position) {
+            response.put_byte(position->first);
+            response.put_byte(position->second);
+        }
+        break;
+    case MISSION_SECRET_PATH:
+        response.put_byte(state.primary_position.first);
+        response.put_byte(state.primary_position.second);
+        // CLIENT_IDA_EVIDENCE: type-2 sub_5E0440 consumes this[9] as role
+        // 273 (PVF APC); sub_5E0540 consumes this[8] as role 33 (PVF object).
+        response.put_int(state.summon_apc_index);
+        response.put_int(state.summon_object_index);
+        break;
+    case MISSION_TIME_ATTACK:
+        response.put_byte(
+            static_cast<int>(state.secondary_positions.size()));
+        for (std::vector<std::pair<int, int> >::const_iterator position =
+                 state.secondary_positions.begin();
+             position != state.secondary_positions.end(); ++position) {
+            response.put_byte(position->first);
+            response.put_byte(position->second);
+        }
+        break;
+    case MISSION_BOSS_ATTACK:
+        response.put_int(state.summon_apc_index);
+        break;
+    default:
+        return;
+    }
+
+    response.finalize(true);
+    user->Send(response);
+}
+
+void SendUpdateResponse(CUser* user) {
+    PacketGuard response;
+    response.put_header(1, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+    response.put_byte(1);
+    response.finalize(true);
+    user->Send(response);
+}
+
+void SendCheckResponse(CUser* user, bool succeeded, int reward_item_id) {
+    PacketGuard response;
+    response.put_header(1,
+                        ENUM_CMDPACKET_DUNGEON_MISSION_CHECK_SUCCESS);
+    response.put_byte(1);
+    response.put_byte(succeeded ? 1 : 0);
+    if (succeeded) {
+        response.put_int(reward_item_id);
+    }
+    response.finalize(true);
+    user->Send(response);
+}
+
+bool GrantReward(CUser* user, int item_id) {
+    CItem* const item = item_id > 0 && G_CDataManager()
+        ? G_CDataManager()->find_item(item_id)
+        : 0;
+    if (!user || !item || item->is_stackable() != 1 ||
+        !user->getCurCharacInvenRefR() ||
+        !user->getCurCharacInvenW()) {
+        return false;
+    }
+
+    std::vector<std::pair<int, int> > rewards;
+    rewards.push_back(std::make_pair(item_id, kMissionRewardItemCount));
+
+    CInventory preview;
+    InventoryMemory preview_memory;
+    preview.SetInventoryMemory(&preview_memory);
+    preview.setCopy(*user->getCurCharacInvenRefR());
+    if (preview.tryInsertEventItems(rewards) !=
+        static_cast<int>(rewards.size())) {
+        return false;
+    }
+
+    std::vector<int> inserted_slots;
+    const int inserted = user->getCurCharacInvenW()->insert_event_items(
+        rewards,
+        inserted_slots,
+        static_cast<eMoneyAddReason>(0),
+        // Reason 8 is the existing typed event/quest grant route.  No new DB
+        // owner is needed for this session-only mission reward transaction.
+        static_cast<eItemAddReason>(8),
+        false,
+        "",
+        "");
+    // inventory_event_items.cpp emits exactly one
+    // {slot, item_id, add_info} triple per inserted stackable entry.  Every
+    // target DungeonMission reward is present in stackable.lst, so accepting
+    // any other shape would hide a broken transaction/output contract.
+    if (inserted != 1 || inserted_slots.size() != 3u) {
+        return false;
+    }
+
+    user->SendUpdateItem(static_cast<CUser::eSendTarget>(1),
+                         static_cast<ENUM_ITEMSPACE>(0),
+                         inserted_slots[0]);
+    return true;
+}
+
+bool PositionIsCurrentServerRoom(CParty* party,
+                                 const std::pair<int, int>& position) {
+    if (!party) {
+        return false;
+    }
+    CBattle_Field& battle_field = party->battle_field();
+    int current_x = -1;
+    int current_y = -1;
+    battle_field.getCurPosXY(current_x, current_y);
+    return position == std::make_pair(current_x, current_y);
+}
+
+}  // namespace
+
+void WriteDungeonInfoTail(CParty* party,
+                          CBattle_Field* battle_field,
+                          InterfacePacketBuf* packet) {
+    if (!packet) {
+        return;
+    }
+
+    PartyMissionState* state = 0;
+    if (party && battle_field) {
+        PartyMissionState& candidate = PartyStates()[party];
+        if (!candidate.prepared ||
+            candidate.dungeon_index != battle_field->get_dungeon_index()) {
+            PrepareState(party, battle_field, candidate);
+        }
+        state = &candidate;
+    }
+
+    // CLIENT_IDA_EVIDENCE: after the champion-break enable byte owned by
+    // champion_break, NOTI28 sub_582250 consumes the mission descriptor u32,
+    // then mission type/x/y. Descriptor -1 suppresses construction.
+    if (!state || !state->offered) {
+        packet->put_int(-1);
+        packet->put_byte(0);
+        packet->put_byte(0);
+        packet->put_byte(0);
+        return;
+    }
+
+    CUser* const manager = party ? party->getManager() : 0;
+    LogManager::logFormat(
+        1,
+        kDungeonMissionDiagFile,
+        "void dungeon_mission::WriteDungeonInfoTail(CParty*,CBattle_Field*,InterfacePacketBuf*)",
+        0,
+        "[DUNGEON_MISSION][NOTI28] result=offered party=%d account=%d charac=%d dungeon=%d type=%d npc=%d npc_room=%d,%d",
+        party ? party->GetPartyIndex() : -1,
+        GetAccountId(manager),
+        GetCharacterNo(manager),
+        state->dungeon_index,
+        state->definition.type,
+        state->definition.npc_index,
+        state->npc_position.first,
+        state->npc_position.second);
+
+    packet->put_int(state->definition.npc_index);
+    packet->put_byte(state->definition.type);
+    packet->put_byte(state->npc_position.first);
+    packet->put_byte(state->npc_position.second);
+}
+
+int GetStartMapResourceIndex(CParty* party, CBattle_Field* battle_field) {
+    if (!party || !battle_field) {
+        return -1;
+    }
+    PartyStateMap::iterator found = PartyStates().find(party);
+    if (found == PartyStates().end()) {
+        return -1;
+    }
+    PartyMissionState& state = found->second;
+    if (!state.offered || !state.any_started ||
+        state.dungeon_index != battle_field->get_dungeon_index()) {
+        if (state.offered && state.definition.type == MISSION_TIME_ATTACK) {
+            int current_x = -1;
+            int current_y = -1;
+            battle_field->getCurPosXY(current_x, current_y);
+            CUser* const manager = party->getManager();
+            LogManager::logFormat(
+                1,
+                kDungeonMissionDiagFile,
+                "int dungeon_mission::GetStartMapResourceIndex(CParty*,CBattle_Field*)",
+                0,
+                "[DUNGEON_MISSION][NOTI29] result=skip reason=%s party=%d account=%d charac=%d dungeon=%d state_dungeon=%d type=%d room=%d,%d any_started=%d",
+                !state.any_started ? "not_started" : "dungeon_mismatch",
+                party->GetPartyIndex(),
+                GetAccountId(manager),
+                GetCharacterNo(manager),
+                battle_field->get_dungeon_index(),
+                state.dungeon_index,
+                state.definition.type,
+                current_x,
+                current_y,
+                state.any_started ? 1 : 0);
+        }
+        return -1;
+    }
+
+    int pos_x = -1;
+    int pos_y = -1;
+    battle_field->getCurPosXY(pos_x, pos_y);
+    const std::pair<int, int> current(pos_x, pos_y);
+
+    // CLIENT_IDA_EVIDENCE: NOTI29 sub_58A7C0 reads this u32 at 0x58A95E,
+    // then sub_5DE620/0x764D90 stores it in mission this[7].  The five client
+    // vtables create their mission-local roles from that per-room value.
+    int resource_index = -1;
+    switch (state.definition.type) {
+    case MISSION_HIDDEN_MONSTER:
+        if (current == state.primary_position) {
+            resource_index = state.definition.summon_monster_index;
+        } else if (std::find(state.secondary_positions.begin(),
+                             state.secondary_positions.end(),
+                             current) != state.secondary_positions.end()) {
+            resource_index = state.definition.dummy_index;
+        }
+        break;
+    case MISSION_TREASURE_BOX:
+        resource_index = current == state.primary_position
+            ? state.definition.summon_object_index
+            : -1;
+        break;
+    case MISSION_SECRET_PATH:
+        // Despite its PVF tag name, 15153 is the passive-object gate consumed
+        // as this[7].  CMD552 separately supplies this[8]=doorbox1 (15144).
+        resource_index = current == state.primary_position
+            ? state.definition.summon_monster_index
+            : -1;
+        break;
+    case MISSION_TIME_ATTACK:
+        resource_index = IsObjectivePosition(state, current)
+            ? state.definition.summon_monster_index
+            : -1;
+        break;
+    case MISSION_BOSS_ATTACK:
+    default:
+        // Type 4 receives its local APC directly in CMD552.
+        break;
+    }
+
+    if (state.definition.type == MISSION_TIME_ATTACK) {
+        CUser* const manager = party->getManager();
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "int dungeon_mission::GetStartMapResourceIndex(CParty*,CBattle_Field*)",
+            0,
+            "[DUNGEON_MISSION][NOTI29] result=%s party=%d account=%d charac=%d dungeon=%d type=%d room=%d,%d target=%d resource=%d any_started=%d",
+            resource_index > 0 ? "resource" : "no_resource",
+            party->GetPartyIndex(),
+            GetAccountId(manager),
+            GetCharacterNo(manager),
+            state.dungeon_index,
+            state.definition.type,
+            pos_x,
+            pos_y,
+            GetObjectiveIndex(state, current),
+            resource_index,
+            state.any_started ? 1 : 0);
+    }
+    return resource_index;
+}
+
+void ResetParty(CParty* party) {
+    if (party) {
+        PartyStateMap::iterator found = PartyStates().find(party);
+        if (found != PartyStates().end() && found->second.offered) {
+            CUser* const manager = party->getManager();
+            LogManager::logFormat(
+                1,
+                kDungeonMissionDiagFile,
+                "void dungeon_mission::ResetParty(CParty*)",
+                0,
+                "[DUNGEON_MISSION][RESET] party=%d account=%d charac=%d dungeon=%d type=%d any_started=%d users=%d",
+                party->GetPartyIndex(),
+                GetAccountId(manager),
+                GetCharacterNo(manager),
+                found->second.dungeon_index,
+                found->second.definition.type,
+                found->second.any_started ? 1 : 0,
+                static_cast<int>(found->second.users.size()));
+        }
+        PartyStates().erase(party);
+    }
+}
+
+bool SendTimerLayout(CUser* user) {
+    PartyMissionState* const state = FindState(user);
+    if (!state || state->definition.type != MISSION_HIDDEN_MONSTER) {
+        return false;
+    }
+
+    PacketGuard notification;
+    notification.put_header(
+        0, ENUM_NOTIPACKET_DUNGEON_MISSION_TIMER_ACTION);
+    notification.put_byte(0);
+    notification.put_byte(state->primary_position.first);
+    notification.put_byte(state->primary_position.second);
+
+    notification.put_byte(
+        static_cast<int>(state->secondary_positions.size()));
+    for (std::vector<std::pair<int, int> >::const_iterator position =
+             state->secondary_positions.begin();
+         position != state->secondary_positions.end(); ++position) {
+        notification.put_byte(position->first);
+        notification.put_byte(position->second);
+    }
+    notification.finalize(true);
+    user->Send(notification);
+    return true;
+}
+
+int HandleStart(CUser* user, PacketBuf& packet) {
+    if (!PacketBodyConsumed(packet)) {
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "int dungeon_mission::HandleStart(CUser*,PacketBuf&)",
+            0,
+            "[DUNGEON_MISSION][CMD552] result=reject reason=bad_body account=%d charac=%d cursor=%d declared=%d packet_error=%d",
+            GetAccountId(user),
+            GetCharacterNo(user),
+            packet.get_index(),
+            PacketDeclaredLength(packet),
+            static_cast<int>(packet.getLastError()));
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_START);
+        return 0;
+    }
+    PartyMissionState* const state = FindState(user);
+    UserProgress* const progress = state
+        ? FindOrCreateProgress(user, *state)
+        : 0;
+    if (!state || !progress) {
+        CParty* const party = user ? user->GetParty() : 0;
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "int dungeon_mission::HandleStart(CUser*,PacketBuf&)",
+            0,
+            "[DUNGEON_MISSION][CMD552] result=reject reason=%s party=%d account=%d charac=%d user_state=%d",
+            state ? "charac_no_invalid" : FindStateFailureReason(user),
+            party ? party->GetPartyIndex() : -1,
+            GetAccountId(user),
+            GetCharacterNo(user),
+            user ? user->get_state() : -1);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_START);
+        return 0;
+    }
+
+    if (!progress->started) {
+        CParty* const party = user->GetParty();
+        int current_x = -1;
+        int current_y = -1;
+        GetCurrentRoom(party, current_x, current_y);
+        const bool room_matches = party &&
+            PositionIsCurrentServerRoom(party, state->npc_position);
+        const int grid_clear = party
+            ? party->battle_field().check_grid_clear()
+            : -1;
+        if (!party || !room_matches || grid_clear != 1) {
+            LogManager::logFormat(
+                1,
+                kDungeonMissionDiagFile,
+                "int dungeon_mission::HandleStart(CUser*,PacketBuf&)",
+                0,
+                "[DUNGEON_MISSION][CMD552] result=reject reason=%s party=%d account=%d charac=%d dungeon=%d type=%d room=%d,%d npc_room=%d,%d grid_clear=%d any_started=%d",
+                !party ? "party_missing"
+                       : (!room_matches ? "npc_room_mismatch"
+                                        : "npc_room_not_clear"),
+                party ? party->GetPartyIndex() : -1,
+                GetAccountId(user),
+                GetCharacterNo(user),
+                state->dungeon_index,
+                state->definition.type,
+                current_x,
+                current_y,
+                state->npc_position.first,
+                state->npc_position.second,
+                grid_clear,
+                state->any_started ? 1 : 0);
+            SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_START);
+            return 0;
+        }
+        progress->started = true;
+        progress->started_at = CurrentSecond();
+        state->any_started = true;
+        int objective0_x = -1;
+        int objective0_y = -1;
+        int objective1_x = -1;
+        int objective1_y = -1;
+        GetObjectiveForTrace(*state, 0u, objective0_x, objective0_y);
+        GetObjectiveForTrace(*state, 1u, objective1_x, objective1_y);
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "int dungeon_mission::HandleStart(CUser*,PacketBuf&)",
+            0,
+            "[DUNGEON_MISSION][CMD552] result=accepted party=%d account=%d charac=%d dungeon=%d type=%d room=%d,%d npc_room=%d,%d grid_clear=%d started_at=%u limit=%d objectives=%d obj0=%d,%d obj1=%d,%d monster=%d",
+            party->GetPartyIndex(),
+            GetAccountId(user),
+            GetCharacterNo(user),
+            state->dungeon_index,
+            state->definition.type,
+            current_x,
+            current_y,
+            state->npc_position.first,
+            state->npc_position.second,
+            grid_clear,
+            progress->started_at,
+            state->definition.time_limit,
+            static_cast<int>(state->objective_positions.size()),
+            objective0_x,
+            objective0_y,
+            objective1_x,
+            objective1_y,
+            state->definition.summon_monster_index);
+    } else {
+        CParty* const party = user->GetParty();
+        int current_x = -1;
+        int current_y = -1;
+        GetCurrentRoom(party, current_x, current_y);
+        const uint32_t now = CurrentSecond();
+        LogManager::logFormat(
+            1,
+            kDungeonMissionDiagFile,
+            "int dungeon_mission::HandleStart(CUser*,PacketBuf&)",
+            0,
+            "[DUNGEON_MISSION][CMD552] result=replay party=%d account=%d charac=%d dungeon=%d type=%d room=%d,%d started_at=%u now=%u elapsed=%u limit=%d confirmed=%d",
+            party ? party->GetPartyIndex() : -1,
+            GetAccountId(user),
+            GetCharacterNo(user),
+            state->dungeon_index,
+            state->definition.type,
+            current_x,
+            current_y,
+            progress->started_at,
+            now,
+            ElapsedSeconds(progress, now),
+            state->definition.time_limit,
+            static_cast<int>(progress->confirmed_positions.size()));
+    }
+    // Replayed CMD552 is idempotent for this member: it returns the same layout
+    // without extending that member's first-start deadline.
+    SendStartResponse(user, *state);
+    return 0;
+}
+
+int HandleUpdate(CUser* user, PacketBuf& packet) {
+    unsigned char request_type = 0xffu;
+    if (packet.get_byte(request_type) != 1) {
+        CParty* const party = user ? user->GetParty() : 0;
+        PartyMissionState* const state = FindState(user);
+        UserProgress* const progress = state
+            ? FindProgress(user, *state)
+            : 0;
+        TraceUpdate(user, packet, "reject", "missing_request_type", -1,
+                    -1, -1, state, progress, party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+
+    unsigned char completed = 0u;
+    unsigned char pos_x = 0u;
+    unsigned char pos_y = 0u;
+    unsigned char reserved = 0xffu;
+    if (request_type == MISSION_HIDDEN_MONSTER) {
+        if (packet.get_byte(completed) != 1 ||
+            packet.get_byte(pos_x) != 1 ||
+            packet.get_byte(pos_y) != 1) {
+            CParty* const party = user ? user->GetParty() : 0;
+            PartyMissionState* const state = FindState(user);
+            UserProgress* const progress = state
+                ? FindProgress(user, *state)
+                : 0;
+            TraceUpdate(user, packet, "reject", "bad_hidden_body",
+                        request_type, pos_x, pos_y, state, progress, party);
+            SendCommandError(user,
+                             ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+            return 0;
+        }
+    } else if (request_type == MISSION_SECRET_PATH) {
+        if (packet.get_byte(reserved) != 1) {
+            CParty* const party = user ? user->GetParty() : 0;
+            PartyMissionState* const state = FindState(user);
+            UserProgress* const progress = state
+                ? FindProgress(user, *state)
+                : 0;
+            TraceUpdate(user, packet, "reject", "bad_secret_body",
+                        request_type, -1, -1, state, progress, party);
+            SendCommandError(user,
+                             ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+            return 0;
+        }
+    } else if (request_type == MISSION_TIME_ATTACK) {
+        if (packet.get_byte(pos_x) != 1) {
+            CParty* const party = user ? user->GetParty() : 0;
+            PartyMissionState* const state = FindState(user);
+            UserProgress* const progress = state
+                ? FindProgress(user, *state)
+                : 0;
+            TraceUpdate(user, packet, "reject", "bad_type3_body_x",
+                        request_type, -1, -1, state, progress, party);
+            SendCommandError(user,
+                             ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+            return 0;
+        }
+        if (packet.get_byte(pos_y) != 1) {
+            CParty* const party = user ? user->GetParty() : 0;
+            PartyMissionState* const state = FindState(user);
+            UserProgress* const progress = state
+                ? FindProgress(user, *state)
+                : 0;
+            TraceUpdate(user, packet, "reject", "bad_type3_body_y",
+                        request_type, pos_x, -1, state, progress, party);
+            SendCommandError(user,
+                             ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+            return 0;
+        }
+    } else {
+        CParty* const party = user ? user->GetParty() : 0;
+        PartyMissionState* const state = FindState(user);
+        UserProgress* const progress = state
+            ? FindProgress(user, *state)
+            : 0;
+        TraceUpdate(user, packet, "reject", "unsupported_request_type",
+                    request_type, -1, -1, state, progress, party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+
+    if (!PacketBodyConsumed(packet)) {
+        CParty* const party = user ? user->GetParty() : 0;
+        PartyMissionState* const state = FindState(user);
+        UserProgress* const progress = state
+            ? FindProgress(user, *state)
+            : 0;
+        TraceUpdate(user, packet, "reject", "bad_semantic_length",
+                    request_type, pos_x, pos_y, state, progress, party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+
+    PartyMissionState* const state = FindState(user);
+    UserProgress* const progress = state
+        ? FindOrCreateProgress(user, *state)
+        : 0;
+    CParty* const party = user ? user->GetParty() : 0;
+    if (!state) {
+        TraceUpdate(user, packet, "reject", FindStateFailureReason(user),
+                    request_type, pos_x, pos_y, state, progress, party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+    if (!progress) {
+        TraceUpdate(user, packet, "reject", "charac_no_invalid",
+                    request_type, pos_x, pos_y, state, progress, party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+    if (!party) {
+        TraceUpdate(user, packet, "reject", "party_missing",
+                    request_type, pos_x, pos_y, state, progress, party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+    if (!progress->started) {
+        TraceUpdate(user, packet, "reject", "not_started",
+                    request_type, pos_x, pos_y, state, progress, party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+    if (request_type != state->definition.type) {
+        TraceUpdate(user, packet, "reject", "type_mismatch",
+                    request_type, pos_x, pos_y, state, progress, party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+    if (IsExpired(*state, *progress)) {
+        TraceUpdate(user, packet, "reject", "expired",
+                    request_type, pos_x, pos_y, state, progress, party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+
+    std::pair<int, int> confirmed_position = state->primary_position;
+    if (request_type == MISSION_HIDDEN_MONSTER) {
+        confirmed_position = std::make_pair(
+            static_cast<int>(pos_x), static_cast<int>(pos_y));
+        const bool primary = confirmed_position == state->primary_position;
+        const bool dummy = std::find(state->secondary_positions.begin(),
+                                     state->secondary_positions.end(),
+                                     confirmed_position) !=
+                           state->secondary_positions.end();
+        // CLIENT_IDA_EVIDENCE: sub_5E00F0 sends CMD553 for both the real
+        // monster and every dummy.  completed is true only after the real
+        // target count is satisfied; completed=0 at a dummy is valid progress.
+        if ((!primary && !dummy) ||
+            (primary && completed != 1u) ||
+            (dummy && completed != 0u)) {
+            TraceUpdate(user, packet, "reject", "hidden_semantics",
+                        request_type, pos_x, pos_y, state, progress, party);
+            SendCommandError(user,
+                             ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+            return 0;
+        }
+    } else if (request_type == MISSION_SECRET_PATH) {
+        if (reserved != 0u) {
+            TraceUpdate(user, packet, "reject", "secret_reserved",
+                        request_type, -1, -1, state, progress, party);
+            SendCommandError(user,
+                             ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+            return 0;
+        }
+    } else {
+        confirmed_position = std::make_pair(
+            static_cast<int>(pos_x), static_cast<int>(pos_y));
+        if (!IsObjectivePosition(*state, confirmed_position)) {
+            TraceUpdate(user, packet, "reject", "objective_miss",
+                        request_type, pos_x, pos_y, state, progress, party);
+            SendCommandError(user,
+                             ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+            return 0;
+        }
+    }
+
+    // Mission roles are client-local, but their callback must report the exact
+    // room currently owned by the authoritative server maze.
+    if (!PositionIsCurrentServerRoom(party, confirmed_position)) {
+        TraceUpdate(user, packet, "reject", "current_room_mismatch",
+                    request_type,
+                    confirmed_position.first,
+                    confirmed_position.second,
+                    state,
+                    progress,
+                    party);
+        SendCommandError(user, ENUM_CMDPACKET_DUNGEON_MISSION_UPDATE);
+        return 0;
+    }
+
+    const bool inserted =
+        progress->confirmed_positions.insert(confirmed_position).second;
+    TraceUpdate(user,
+                packet,
+                inserted ? "accepted_new" : "accepted_duplicate",
+                "none",
+                request_type,
+                confirmed_position.first,
+                confirmed_position.second,
+                state,
+                progress,
+                party);
+    SendUpdateResponse(user);
+    return 0;
+}
+
+int HandleCheckSuccess(CUser* user, PacketBuf& packet) {
+    if (!PacketBodyConsumed(packet)) {
+        CParty* const party = user ? user->GetParty() : 0;
+        PartyMissionState* const state = FindState(user);
+        UserProgress* const progress = state
+            ? FindProgress(user, *state)
+            : 0;
+        TraceCheck(user, packet, "reject", "bad_body", 0,
+                   state, progress, party);
+        SendCommandError(
+            user, ENUM_CMDPACKET_DUNGEON_MISSION_CHECK_SUCCESS);
+        return 0;
+    }
+    PartyMissionState* const state = FindState(user);
+    UserProgress* const progress = state
+        ? FindOrCreateProgress(user, *state)
+        : 0;
+    CParty* const party = user ? user->GetParty() : 0;
+    if (!state) {
+        TraceCheck(user, packet, "reject", FindStateFailureReason(user), 0,
+                   state, progress, party);
+        SendCommandError(
+            user, ENUM_CMDPACKET_DUNGEON_MISSION_CHECK_SUCCESS);
+        return 0;
+    }
+    if (!progress) {
+        TraceCheck(user, packet, "reject", "charac_no_invalid", 0,
+                   state, progress, party);
+        SendCommandError(
+            user, ENUM_CMDPACKET_DUNGEON_MISSION_CHECK_SUCCESS);
+        return 0;
+    }
+    if (!party) {
+        TraceCheck(user, packet, "reject", "party_missing", 0,
+                   state, progress, party);
+        SendCommandError(
+            user, ENUM_CMDPACKET_DUNGEON_MISSION_CHECK_SUCCESS);
+        return 0;
+    }
+    if (!progress->started) {
+        TraceCheck(user, packet, "reject", "not_started", 0,
+                   state, progress, party);
+        SendCommandError(
+            user, ENUM_CMDPACKET_DUNGEON_MISSION_CHECK_SUCCESS);
+        return 0;
+    }
+
+    // CLIENT_IDA_EVIDENCE: type 1/4 report completion with an empty CMD554,
+    // so the request itself contains no objective proof.  Keep the server's
+    // maze authoritative: both callbacks are valid only in their selected
+    // objective room, and the boss-attack callback additionally requires the
+    // real boss room to have reached the ordinary grid-clear state.  This
+    // prevents an early/replayed empty packet from claiming the reward while
+    // preserving the client's local APC/passive-object completion callback.
+    if ((state->definition.type == MISSION_TREASURE_BOX ||
+         state->definition.type == MISSION_BOSS_ATTACK) &&
+        !PositionIsCurrentServerRoom(party, state->primary_position)) {
+        TraceCheck(user, packet, "pending", "objective_room_mismatch", 0,
+                   state, progress, party);
+        SendCheckResponse(user, false, 0);
+        return 0;
+    }
+    if (state->definition.type == MISSION_BOSS_ATTACK &&
+        party->battle_field().check_grid_clear() != 1) {
+        TraceCheck(user, packet, "pending", "boss_room_not_clear", 0,
+                   state, progress, party);
+        SendCheckResponse(user, false, 0);
+        return 0;
+    }
+
+    if (progress->rewarded) {
+        TraceCheck(user, packet, "replay_reward", "none",
+                   progress->reward_item_id, state, progress, party);
+        SendCheckResponse(user, true, progress->reward_item_id);
+        return 0;
+    }
+
+    if (IsExpired(*state, *progress)) {
+        TraceCheck(user, packet, "pending", "expired", 0,
+                   state, progress, party);
+        SendCheckResponse(user, false, 0);
+        return 0;
+    }
+    if (!IsMissionComplete(*state, *progress)) {
+        TraceCheck(user, packet, "pending", "incomplete", 0,
+                   state, progress, party);
+        SendCheckResponse(user, false, 0);
+        return 0;
+    }
+
+    const int reward_item_id = SelectRewardItem(*state);
+    if (reward_item_id <= 0) {
+        TraceCheck(user, packet, "pending", "reward_select_failed", 0,
+                   state, progress, party);
+        SendCheckResponse(user, false, 0);
+        return 0;
+    }
+    if (!GrantReward(user, reward_item_id)) {
+        // Inventory-full and invalid-PVF-item outcomes remain retryable and
+        // never latch success before the inventory transaction commits.
+        TraceCheck(user, packet, "pending", "reward_grant_failed",
+                   reward_item_id, state, progress, party);
+        SendCheckResponse(user, false, 0);
+        return 0;
+    }
+
+    progress->rewarded = true;
+    progress->reward_item_id = reward_item_id;
+    TraceCheck(user, packet, "rewarded", "none", reward_item_id,
+               state, progress, party);
+    SendCheckResponse(user, true, reward_item_id);
+    return 0;
+}
+
+}  // namespace dungeon_mission
+
+bool CBattle_Field::BuildDungeonMissionCoordinates(
+    int mission_type,
+    int requested_secondary_count,
+    std::pair<int, int>& npc_position,
+    std::pair<int, int>& primary,
+    std::vector<std::pair<int, int> >& secondary) const {
+    npc_position = std::make_pair(-1, -1);
+    primary = std::make_pair(-1, -1);
+    secondary.clear();
+    if (!maze_ || maze_->grid_width <= 0 || maze_->grid_height <= 0 ||
+        requested_secondary_count < 0 || requested_secondary_count > 255) {
+        return false;
+    }
+
+    std::vector<std::pair<int, int> > cells;
+    for (int pos_y = 0; pos_y < maze_->grid_height && pos_y <= 255;
+         ++pos_y) {
+        for (int pos_x = 0; pos_x < maze_->grid_width && pos_x <= 255;
+             ++pos_x) {
+            if (maze_->getGridR(pos_x, pos_y).grid_type != 0) {
+                cells.push_back(std::make_pair(pos_x, pos_y));
+            }
+        }
+    }
+    if (cells.empty()) {
+        return false;
+    }
+
+    std::vector<std::pair<int, int> > eligible;
+    for (std::vector<std::pair<int, int> >::const_iterator cell =
+             cells.begin();
+         cell != cells.end(); ++cell) {
+        if (*cell != maze_start_position_ && *cell != maze_boss_position_) {
+            eligible.push_back(*cell);
+        }
+    }
+    if (eligible.empty()) {
+        return false;
+    }
+
+    for (size_t count = eligible.size(); count > 1u; --count) {
+        const size_t selected = static_cast<size_t>(
+            get_rand_int(static_cast<int>(count)));
+        std::swap(eligible[count - 1u], eligible[selected]);
+    }
+
+    // NOTI28's NPC room is a pre-start contact stage, not an objective room.
+    // Keep it distinct so clearing the NPC room can legitimately unlock
+    // CMD552 without completing or invalidating the mission itself.
+    npc_position = eligible[0];
+
+    if (mission_type == dungeon_mission::MISSION_BOSS_ATTACK) {
+        if (std::find(cells.begin(), cells.end(), maze_boss_position_) ==
+            cells.end()) {
+            return false;
+        }
+        primary = maze_boss_position_;
+        return true;
+    }
+
+    // Non-boss missions require one independent objective cell in addition to
+    // the NPC room.  Start and boss cells remain excluded from both stages.
+    if (eligible.size() < 2u) {
+        return false;
+    }
+    primary = eligible[1];
+
+    std::vector<std::pair<int, int> > remaining;
+    for (size_t index = 2u; index < eligible.size(); ++index) {
+        remaining.push_back(eligible[index]);
+    }
+
+    if (mission_type == dungeon_mission::MISSION_TIME_ATTACK) {
+        const int target_count = std::max(1, requested_secondary_count);
+        if (static_cast<int>(remaining.size()) + 1 < target_count) {
+            return false;
+        }
+        secondary.push_back(primary);
+        for (int index = 1; index < target_count; ++index) {
+            secondary.push_back(remaining[static_cast<size_t>(index - 1)]);
+        }
+        return true;
+    }
+
+    if (mission_type == dungeon_mission::MISSION_HIDDEN_MONSTER ||
+        mission_type == dungeon_mission::MISSION_TREASURE_BOX) {
+        if (static_cast<int>(remaining.size()) <
+            requested_secondary_count) {
+            return false;
+        }
+        for (int index = 0; index < requested_secondary_count; ++index) {
+            secondary.push_back(remaining[static_cast<size_t>(index)]);
+        }
+    }
+    return true;
+}
